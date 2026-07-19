@@ -20,9 +20,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 
 MAIN_ADMINS = [5479947797, 1301864145]
-token = ""
-data_folder_path = os.path.dirname(__file__) + "/LavenderData"
+token = os.environ.get("API_TOKEN")
+data_folder_path = os.path.dirname(__file__) + "/data"
 LOCK_FILE = "/tmp/lavender_bot.lock"
+
+if not token:
+    raise ValueError("API_TOKEN не задан в переменных окружения")
 
 MAX_MESSAGES_PER_SECOND = 2
 MAX_MESSAGES_PER_MINUTE = 20
@@ -974,8 +977,13 @@ async def start_command(message: Message, state: FSMContext):
 
         try:
             result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
-            if result and result[0] in ["sended", "applied", "canceled"]:
-                keyboard.append([KeyboardButton(text="Информация о заявке")])
+            if result:
+                state_db = result[0]
+                if state_db in ["sended", "applied", "canceled"]:
+                    keyboard.append([KeyboardButton(text="Информация о заявке")])
+                
+                if state_db == "applied":
+                    keyboard.append([KeyboardButton(text="🔗 Получить ссылку")])
         except:
             pass
 
@@ -2877,6 +2885,39 @@ async def process_invite_chat_input(message: Message, state: FSMContext):
     await state.clear()
     await show_invite_settings_menu(message, state)
 
+async def get_invite_link_for_user(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    result = db_execute("SELECT state, invite_link FROM applications WHERE user = ?", (user_id,), fetch=True)
+    if not result:
+        await message.answer("Вы ещё не подавали заявку.")
+        return
+    
+    state_db, invite_link = result
+    
+    if state_db != "applied":
+        await message.answer("Ваша заявка ещё не одобрена.")
+        return
+    
+    if invite_link:
+        await message.answer(f"Ваша ссылка для входа:\n{invite_link}\n\n⚠️ Ссылка одноразовая! После использования она станет недействительной.")
+        return
+    
+    new_link = await generate_invite_link_for_user(user_id)
+    
+    if new_link:
+        db_execute("UPDATE applications SET invite_link = ? WHERE user = ?", (new_link, user_id))
+        await message.answer(f"Ваша новая ссылка для входа:\n{new_link}\n\n⚠️ Ссылка одноразовая! После использования она станет недействительной.")
+        logger.info(f"Пользователю {user_id} сгенерирована новая ссылка")
+    else:
+        settings = get_invite_settings()
+        if not settings["is_enabled"]:
+            await message.answer("❌ Генерация ссылок отключена администратором. Обратитесь к администратору.")
+        elif not settings["chat_id"]:
+            await message.answer("❌ Чат для ссылок не настроен. Обратитесь к администратору.")
+        else:
+            await message.answer("❌ Не удалось сгенерировать ссылку. Попробуйте позже или обратитесь к администратору.")
+
 async def info_command(message: Message, state: FSMContext):
     user_id = message.from_user.id
     logger.info(f"Пользователь {user_id} запросил информацию о заявке")
@@ -3158,7 +3199,10 @@ async def handle_text(message: Message, state: FSMContext):
         await apply_format_change(message, state, msg_text)
         return
     
-    if msg_text == "О сервере":
+    if msg_text == "🔗 Получить ссылку":
+        await get_invite_link_for_user(message, state)
+        return
+    elif msg_text == "О сервере":
         await send_formatted_message(message, "server_info_text")
         return
     elif msg_text == "Подать заявку":
