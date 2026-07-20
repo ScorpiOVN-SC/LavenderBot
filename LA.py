@@ -177,7 +177,7 @@ def format_user_link(user_id, tag):
     if tag and tag != "no_username":
         return f'<a href="tg://user?id={user_id}">@{escape_html(tag)}</a>'
     else:
-        return f'<code>{user_id}</code>'
+        return f'<a href="tg://user?id={user_id}">{user_id}</a>'
 
 def is_user_banned(user_id):
     if user_id in banned_users:
@@ -652,6 +652,114 @@ def get_last_invite_link():
     settings = get_invite_settings()
     return settings.get("last_invite_link")
 
+def estimate_account_age(user_id: int):
+    """
+    Математическая оценка возраста аккаунта по ID
+    Основано на анализе распределения ID в Telegram
+    """
+    # Базовая дата - примерно когда появились ID такого порядка
+    # Чем меньше ID, тем старше аккаунт
+    if user_id < 100000:
+        years = 10
+        days = 3650
+    elif user_id < 1000000:
+        years = 9
+        days = 3285
+    elif user_id < 10000000:
+        years = 8
+        days = 2920
+    elif user_id < 50000000:
+        years = 7
+        days = 2555
+    elif user_id < 100000000:
+        years = 6
+        days = 2190
+    elif user_id < 200000000:
+        years = 5
+        days = 1825
+    elif user_id < 500000000:
+        years = 4
+        days = 1460
+    elif user_id < 1000000000:
+        years = 3
+        days = 1095
+    elif user_id < 2000000000:
+        years = 2
+        days = 730
+    elif user_id < 5000000000:
+        years = 1
+        days = 365
+    else:
+        years = 0
+        days = 0
+    
+    # Корректировка для более точной оценки
+    # Используем линейную аппроксимацию
+    if user_id > 5000000000:
+        # Для очень новых аккаунтов (ID > 5 млрд)
+        # Примерная дата: ID 5 млрд = ~2023 год
+        base_id = 5000000000
+        base_date = datetime(2023, 1, 1)
+        # Примерно 1 млн ID в день
+        days_offset = (user_id - base_id) // 1000000
+        estimated_date = base_date + timedelta(days=days_offset)
+        days = (datetime.now() - estimated_date).days
+        years = days // 365
+    elif user_id > 2000000000:
+        # ID 2 млрд = ~2021 год
+        base_id = 2000000000
+        base_date = datetime(2021, 1, 1)
+        days_offset = (user_id - base_id) // 1000000
+        estimated_date = base_date + timedelta(days=days_offset)
+        days = (datetime.now() - estimated_date).days
+        years = days // 365
+    
+    if days < 0:
+        days = 0
+        years = 0
+    
+    return days, years
+
+async def get_account_age_and_warning(user_id: int):
+    try:
+        # Пытаемся получить через API (может не работать)
+        try:
+            user = await bot.get_chat(user_id)
+            if hasattr(user, 'join_date') and user.join_date:
+                join_date = user.join_date
+                now = datetime.now()
+                days = (now - join_date).days
+                years = days // 365
+                
+                if days < 365:
+                    warning = f"⚠️ Аккаунт создан менее года назад ({days} дн.)"
+                else:
+                    warning = f"✅ Аккаунт создан {years} год назад"
+                
+                date_str = join_date.strftime("%d.%m.%Y")
+                return warning, date_str
+        except:
+            pass
+        
+        # Если API не дал результат - используем математическую оценку
+        days, years = estimate_account_age(user_id)
+        
+        if days == 0:
+            warning = "⚠️ Аккаунт создан недавно (оценка)"
+            date_str = "Недавно (оценка)"
+        elif days < 365:
+            warning = f"⚠️ Аккаунт создан менее года назад (~{days} дн.)"
+            date_str = f"~{days} дн. назад (оценка)"
+        else:
+            warning = f"✅ Аккаунт создан ~{years} год назад (оценка)"
+            date_str = f"~{years} год назад (оценка)"
+        
+        return warning, date_str
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения возраста аккаунта {user_id}: {e}")
+        return None, None
+
 def check_app_configuration():
     try:
         ensure_db_directory()
@@ -922,6 +1030,13 @@ async def send_approved_to_group(user_id: int, admin_id: int = None):
         
         text = f"Пользователь: {user_link}\n"
         text += f"ID: {user_id}\n"
+        
+        account_warning, account_date = await get_account_age_and_warning(user_id)
+        
+        if account_date:
+            text += f"📅 Аккаунт создан: {account_date}\n"
+        if account_warning:
+            text += f"{account_warning}\n"
         
         if admin_id:
             admin_result = db_execute("SELECT tag FROM admins WHERE user_id = ?", (admin_id,), fetch=True)
@@ -1948,12 +2063,19 @@ async def check_applications(message: Message, state: FSMContext):
         
         user_link = format_user_link(user_id, tag)
         
+        account_warning, account_date = await get_account_age_and_warning(user_id)
+        
         check_text_parts = [
             f"Заявка",
             f"ID: <code>{app_id}</code>",
             f"Пользователь: {user_link}",
             f"User ID: <code>{user_id}</code>",
         ]
+        
+        if account_date:
+            check_text_parts.append(f"📅 Аккаунт создан: {account_date}")
+        if account_warning:
+            check_text_parts.append(f"{account_warning}")
         
         warning = get_reapply_warning(user_id)
         if warning:
@@ -2035,6 +2157,8 @@ async def show_next_application(message: Message, state: FSMContext):
         
         user_link = format_user_link(user_id, tag)
         
+        account_warning, account_date = await get_account_age_and_warning(user_id)
+        
         app_index = 1
         for i, app in enumerate(result):
             if app[0] == app_id:
@@ -2047,6 +2171,11 @@ async def show_next_application(message: Message, state: FSMContext):
             f"Пользователь: {user_link}",
             f"User ID: <code>{user_id}</code>",
         ]
+        
+        if account_date:
+            check_text_parts.append(f"📅 Аккаунт создан: {account_date}")
+        if account_warning:
+            check_text_parts.append(f"{account_warning}")
         
         warning = get_reapply_warning(user_id)
         if warning:
@@ -2888,35 +3017,35 @@ async def process_invite_chat_input(message: Message, state: FSMContext):
 async def get_invite_link_for_user(message: Message, state: FSMContext):
     user_id = message.from_user.id
     
-    result = db_execute("SELECT state, invite_link FROM applications WHERE user = ?", (user_id,), fetch=True)
+    result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
     if not result:
         await message.answer("Вы ещё не подавали заявку.")
         return
     
-    state_db, invite_link = result
+    state_db = result[0]
     
     if state_db != "applied":
         await message.answer("Ваша заявка ещё не одобрена.")
-        return
-    
-    if invite_link:
-        await message.answer(f"Ваша ссылка для входа:\n{invite_link}\n\n⚠️ Ссылка одноразовая! После использования она станет недействительной.")
         return
     
     new_link = await generate_invite_link_for_user(user_id)
     
     if new_link:
         db_execute("UPDATE applications SET invite_link = ? WHERE user = ?", (new_link, user_id))
-        await message.answer(f"Ваша новая ссылка для входа:\n{new_link}\n\n⚠️ Ссылка одноразовая! После использования она станет недействительной.")
-        logger.info(f"Пользователю {user_id} сгенерирована новая ссылка")
+        await message.answer(
+            f"🔗 Ваша ссылка для входа:\n{new_link}\n\n"
+            "⚠️ После перехода по ссылке бот автоматически проверит вашу заявку и одобрит вход.\n"
+            "Если у вас возникнут проблемы, обратитесь к администратору."
+        )
+        logger.info(f"Пользователю {user_id} выдана новая ссылка-приглашение")
     else:
         settings = get_invite_settings()
         if not settings["is_enabled"]:
-            await message.answer("❌ Генерация ссылок отключена администратором. Обратитесь к администратору.")
+            await message.answer("❌ Генерация ссылок отключена администратором.")
         elif not settings["chat_id"]:
             await message.answer("❌ Чат для ссылок не настроен. Обратитесь к администратору.")
         else:
-            await message.answer("❌ Не удалось сгенерировать ссылку. Попробуйте позже или обратитесь к администратору.")
+            await message.answer("❌ Не удалось сгенерировать ссылку. Попробуйте позже.")
 
 async def info_command(message: Message, state: FSMContext):
     user_id = message.from_user.id
