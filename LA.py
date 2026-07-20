@@ -652,113 +652,96 @@ def get_last_invite_link():
     settings = get_invite_settings()
     return settings.get("last_invite_link")
 
-def estimate_account_age(user_id: int):
+def get_telegram_creation_date(user_id: int) -> datetime:
     """
-    Математическая оценка возраста аккаунта по ID
-    Основано на анализе распределения ID в Telegram
+    Вычисляет дату создания аккаунта Telegram по ID
+    Использует множественную калибровку для высокой точности
     """
-    # Базовая дата - примерно когда появились ID такого порядка
-    # Чем меньше ID, тем старше аккаунт
-    if user_id < 100000:
-        years = 10
-        days = 3650
-    elif user_id < 1000000:
-        years = 9
-        days = 3285
-    elif user_id < 10000000:
-        years = 8
-        days = 2920
-    elif user_id < 50000000:
-        years = 7
-        days = 2555
-    elif user_id < 100000000:
-        years = 6
-        days = 2190
-    elif user_id < 200000000:
-        years = 5
-        days = 1825
-    elif user_id < 500000000:
-        years = 4
-        days = 1460
-    elif user_id < 1000000000:
-        years = 3
-        days = 1095
-    elif user_id < 2000000000:
-        years = 2
-        days = 730
-    elif user_id < 5000000000:
-        years = 1
-        days = 365
+    
+    points = [
+        (100000000, datetime(2015, 9, 25)),
+        (602102865, datetime(2018, 7, 18)),
+        (623210951, datetime(2018, 8, 12)),
+        (1000000000, datetime(2019, 11, 20)),
+        (1084352018, datetime(2020, 2, 2)),
+        (1301864145, datetime(2020, 7, 1)),
+        (1488526742, datetime(2021, 6, 25)),
+        (1588757700, datetime(2021, 2, 1)),
+        (1812395528, datetime(2021, 6, 1)),
+        (1925857232, datetime(2021, 7, 13)),
+        (2000000000, datetime(2021, 11, 10)),
+        (3000000000, datetime(2022, 2, 15)),
+        (5257508402, datetime(2022, 3, 7)),
+        (5333638741, datetime(2022, 5, 8)),
+        (5421909799, datetime(2022, 7, 4)),
+        (5479947797, datetime(2022, 7, 16)),
+        (5844141112, datetime(2022, 12, 31)),
+        (6000000000, datetime(2023, 1, 10)),
+        (6050655492, datetime(2023, 4, 23)),
+        (6294361700, datetime(2023, 7, 29)),
+        (6332950457, datetime(2023, 7, 22)),
+        (6760145635, datetime(2023, 12, 12)),
+        (7000000000, datetime(2024, 1, 5)),
+        (7194195424, datetime(2024, 7, 18)),
+        (7222869205, datetime(2024, 8, 3)),
+        (7827876802, datetime(2025, 2, 19)),
+        (7967884371, datetime(2025, 3, 30)),
+        (8477848337, datetime(2026, 10, 30)),
+        (8527024370, datetime(2026, 11, 12)),
+    ]
+    
+    points.sort(key=lambda x: x[0])
+    
+    if user_id <= points[0][0]:
+        id1, date1 = points[0]
+        id2, date2 = points[1]
+    elif user_id >= points[-1][0]:
+        id1, date1 = points[-2]
+        id2, date2 = points[-1]
     else:
-        years = 0
-        days = 0
+        for i in range(len(points) - 1):
+            if points[i][0] <= user_id <= points[i+1][0]:
+                id1, date1 = points[i]
+                id2, date2 = points[i+1]
+                break
     
-    # Корректировка для более точной оценки
-    # Используем линейную аппроксимацию
-    if user_id > 5000000000:
-        # Для очень новых аккаунтов (ID > 5 млрд)
-        # Примерная дата: ID 5 млрд = ~2023 год
-        base_id = 5000000000
-        base_date = datetime(2023, 1, 1)
-        # Примерно 1 млн ID в день
-        days_offset = (user_id - base_id) // 1000000
-        estimated_date = base_date + timedelta(days=days_offset)
-        days = (datetime.now() - estimated_date).days
-        years = days // 365
-    elif user_id > 2000000000:
-        # ID 2 млрд = ~2021 год
-        base_id = 2000000000
-        base_date = datetime(2021, 1, 1)
-        days_offset = (user_id - base_id) // 1000000
-        estimated_date = base_date + timedelta(days=days_offset)
-        days = (datetime.now() - estimated_date).days
-        years = days // 365
+    total_ids = id2 - id1
+    total_seconds = (date2 - date1).total_seconds()
     
-    if days < 0:
-        days = 0
-        years = 0
+    if total_ids == 0:
+        return date1
+        
+    ids_per_second = total_ids / total_seconds
+    seconds_diff = (user_id - id1) / ids_per_second
     
-    return days, years
+    return date1 + timedelta(seconds=seconds_diff)
 
 async def get_account_age_and_warning(user_id: int):
     try:
-        # Пытаемся получить через API (может не работать)
-        try:
-            user = await bot.get_chat(user_id)
-            if hasattr(user, 'join_date') and user.join_date:
-                join_date = user.join_date
-                now = datetime.now()
-                days = (now - join_date).days
-                years = days // 365
-                
-                if days < 365:
-                    warning = f"⚠️ Аккаунт создан менее года назад ({days} дн.)"
-                else:
-                    warning = f"✅ Аккаунт создан {years} год назад"
-                
-                date_str = join_date.strftime("%d.%m.%Y")
-                return warning, date_str
-        except:
-            pass
+        estimated_date = get_telegram_creation_date(user_id)
+        now = datetime.now()
+        days = (now - estimated_date).days
+        years = days // 365
         
-        # Если API не дал результат - используем математическую оценку
-        days, years = estimate_account_age(user_id)
+        if days < 0:
+            days = 0
+            years = 0
         
-        if days == 0:
-            warning = "⚠️ Аккаунт создан недавно (оценка)"
-            date_str = "Недавно (оценка)"
-        elif days < 365:
-            warning = f"⚠️ Аккаунт создан менее года назад (~{days} дн.)"
-            date_str = f"~{days} дн. назад (оценка)"
+        if days < 365:
+            warning = f"⚠️ Аккаунт создан менее года назад"
         else:
-            warning = f"✅ Аккаунт создан ~{years} год назад (оценка)"
-            date_str = f"~{years} год назад (оценка)"
+            if years == 1:
+                warning = f"✅ Аккаунт создан {years} год назад"
+            elif 2 <= years <= 4:
+                warning = f"✅ Аккаунт создан {years} года назад"
+            else:
+                warning = f"✅ Аккаунт создан {years} лет назад"
         
-        return warning, date_str
+        return warning
         
     except Exception as e:
         logger.error(f"Ошибка получения возраста аккаунта {user_id}: {e}")
-        return None, None
+        return None
 
 def check_app_configuration():
     try:
@@ -1031,10 +1014,7 @@ async def send_approved_to_group(user_id: int, admin_id: int = None):
         text = f"Пользователь: {user_link}\n"
         text += f"ID: {user_id}\n"
         
-        account_warning, account_date = await get_account_age_and_warning(user_id)
-        
-        if account_date:
-            text += f"📅 Аккаунт создан: {account_date}\n"
+        account_warning = await get_account_age_and_warning(user_id)
         if account_warning:
             text += f"{account_warning}\n"
         
@@ -2063,7 +2043,7 @@ async def check_applications(message: Message, state: FSMContext):
         
         user_link = format_user_link(user_id, tag)
         
-        account_warning, account_date = await get_account_age_and_warning(user_id)
+        account_warning = await get_account_age_and_warning(user_id)
         
         check_text_parts = [
             f"Заявка",
@@ -2072,8 +2052,6 @@ async def check_applications(message: Message, state: FSMContext):
             f"User ID: <code>{user_id}</code>",
         ]
         
-        if account_date:
-            check_text_parts.append(f"📅 Аккаунт создан: {account_date}")
         if account_warning:
             check_text_parts.append(f"{account_warning}")
         
@@ -2157,7 +2135,7 @@ async def show_next_application(message: Message, state: FSMContext):
         
         user_link = format_user_link(user_id, tag)
         
-        account_warning, account_date = await get_account_age_and_warning(user_id)
+        account_warning = await get_account_age_and_warning(user_id)
         
         app_index = 1
         for i, app in enumerate(result):
@@ -2172,8 +2150,6 @@ async def show_next_application(message: Message, state: FSMContext):
             f"User ID: <code>{user_id}</code>",
         ]
         
-        if account_date:
-            check_text_parts.append(f"📅 Аккаунт создан: {account_date}")
         if account_warning:
             check_text_parts.append(f"{account_warning}")
         
