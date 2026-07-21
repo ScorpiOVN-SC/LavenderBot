@@ -934,6 +934,17 @@ def check_app_configuration():
                 default_questions
             )
         
+        cursor.execute("SELECT COUNT(*) FROM texts WHERE text_key = 'welcome_to_chat_text'")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(
+                "INSERT INTO texts (text_key, text_content, parse_mode, description) VALUES (?, ?, ?, ?)",
+                ('welcome_to_chat_text', 
+                 '🎉 Добро пожаловать, {name}!\n\nМы рады приветствовать вас на сервере Lavender Park!\n\nОбязательно ознакомьтесь с правилами в закреплённом сообщении.', 
+                 'HTML', 
+                 'Приветствие при вступлении в чат')
+            )
+            logger.info("Добавлен текст welcome_to_chat_text")
+
         cursor.execute("SELECT COUNT(*) FROM texts")
         if cursor.fetchone()[0] == 0:
             default_texts = [
