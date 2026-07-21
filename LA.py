@@ -13,7 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, ChatJoinRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -575,7 +575,7 @@ def save_to_history(user_id, tag, state, comment=None, answers=None, reviewed_by
 def get_invite_settings():
     try:
         result = db_execute(
-            "SELECT chat_id, is_enabled, last_invite_link, last_generated_at FROM invite_settings LIMIT 1",
+            "SELECT chat_id, is_enabled, last_invite_link, last_generated_at, auto_approve FROM invite_settings LIMIT 1",
             fetch=True
         )
         if result:
@@ -583,11 +583,12 @@ def get_invite_settings():
                 "chat_id": result[0],
                 "is_enabled": bool(result[1]),
                 "last_invite_link": result[2],
-                "last_generated_at": result[3]
+                "last_generated_at": result[3],
+                "auto_approve": bool(result[4]) if len(result) > 4 else False
             }
     except Exception as e:
         logger.error(f"Ошибка получения настроек: {e}")
-    return {"chat_id": None, "is_enabled": False, "last_invite_link": None, "last_generated_at": None}
+    return {"chat_id": None, "is_enabled": False, "last_invite_link": None, "last_generated_at": None, "auto_approve": False}
 
 def set_invite_chat(chat_id, admin_id):
     try:
@@ -613,6 +614,18 @@ def toggle_invite(enable: bool, admin_id):
         logger.error(f"Ошибка переключения: {e}")
         return False
 
+def toggle_auto_approve(enable: bool, admin_id):
+    try:
+        db_execute(
+            "UPDATE invite_settings SET auto_approve = ?, updated_by = ?",
+            (1 if enable else 0, admin_id)
+        )
+        logger.info(f"Админ {admin_id} {'включил' if enable else 'выключил'} авто-одобрение")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка переключения авто-одобрения: {e}")
+        return False
+
 async def generate_invite_link_for_user(user_id: int) -> str:
     settings = get_invite_settings()
     
@@ -629,8 +642,7 @@ async def generate_invite_link_for_user(user_id: int) -> str:
         
         invite_link = await bot.create_chat_invite_link(
             chat_id=chat_id,
-            member_limit=1,
-            creates_join_request=False,
+            creates_join_request=settings["auto_approve"],
             name=f"Приглашение для пользователя {user_id}"
         )
         
@@ -652,12 +664,7 @@ def get_last_invite_link():
     settings = get_invite_settings()
     return settings.get("last_invite_link")
 
-def get_telegram_creation_date(user_id: int) -> datetime:
-    """
-    Вычисляет дату создания аккаунта Telegram по ID
-    Использует множественную калибровку для высокой точности
-    """
-    
+def get_telegram_creation_date(user_id: int):
     points = [
         (100000000, datetime(2015, 9, 25)),
         (602102865, datetime(2018, 7, 18)),
@@ -716,6 +723,17 @@ def get_telegram_creation_date(user_id: int) -> datetime:
     
     return date1 + timedelta(seconds=seconds_diff)
 
+def format_months(days):
+    months = days // 30
+    if months == 0:
+        return "менее месяца"
+    elif months == 1:
+        return "1 месяц"
+    elif 2 <= months <= 4:
+        return f"{months} месяца"
+    else:
+        return f"{months} месяцев"
+
 async def get_account_age_and_warning(user_id: int):
     try:
         estimated_date = get_telegram_creation_date(user_id)
@@ -728,7 +746,8 @@ async def get_account_age_and_warning(user_id: int):
             years = 0
         
         if days < 365:
-            warning = f"⚠️ Аккаунт создан менее года назад"
+            months = format_months(days)
+            warning = f"⚠️ Аккаунт создан ~{months} назад"
         else:
             if years == 1:
                 warning = f"✅ Аккаунт создан {years} год назад"
@@ -866,7 +885,8 @@ def check_app_configuration():
             is_enabled INTEGER DEFAULT 0,
             last_invite_link TEXT,
             last_generated_at TIMESTAMP,
-            updated_by INTEGER
+            updated_by INTEGER,
+            auto_approve INTEGER DEFAULT 0
         )''')
         
         cursor.execute("PRAGMA table_info(invite_settings)")
@@ -881,11 +901,14 @@ def check_app_configuration():
             cursor.execute("ALTER TABLE invite_settings ADD COLUMN last_generated_at TIMESTAMP")
         if 'updated_by' not in columns:
             cursor.execute("ALTER TABLE invite_settings ADD COLUMN updated_by INTEGER")
+        if 'auto_approve' not in columns:
+            cursor.execute("ALTER TABLE invite_settings ADD COLUMN auto_approve INTEGER DEFAULT 0")
+            logger.info("Добавлена колонка auto_approve")
         
         cursor.execute("SELECT COUNT(*) FROM invite_settings")
         if cursor.fetchone()[0] == 0:
             cursor.execute(
-                "INSERT INTO invite_settings (is_enabled) VALUES (0)"
+                "INSERT INTO invite_settings (is_enabled, auto_approve) VALUES (0, 0)"
             )
             logger.info("Создана запись настроек приглашений")
         
@@ -1047,6 +1070,52 @@ async def send_approved_to_group(user_id: int, admin_id: int = None):
         
     except Exception as e:
         logger.error(f"Ошибка отправки в группу: {e}")
+
+@dp.chat_join_request()
+async def handle_join_request(request: ChatJoinRequest):
+    settings = get_invite_settings()
+    
+    if not settings["auto_approve"]:
+        logger.info(f"Авто-одобрение отключено, запрос от {request.from_user.id} отклонён")
+        await request.decline()
+        return
+    
+    user_id = request.from_user.id
+    chat_id = request.chat.id
+    
+    logger.info(f"Запрос на вступление от {user_id} в чат {chat_id}")
+    
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            await request.decline()
+            logger.warning(f"❌ Пользователь {user_id} уже в группе")
+            return
+    except:
+        pass
+    
+    result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
+    
+    if result and result[0] == "applied":
+        try:
+            await request.approve()
+            logger.info(f"✅ Запрос пользователя {user_id} одобрен автоматически")
+            
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎉 Добро пожаловать! Пользователь {request.from_user.first_name} присоединился по одноразовой ссылке."
+                )
+            except:
+                pass
+        except Exception as e:
+            logger.error(f"Ошибка одобрения запроса {user_id}: {e}")
+    else:
+        try:
+            await request.decline()
+            logger.warning(f"❌ Запрос пользователя {user_id} отклонён (не в списке одобренных)")
+        except Exception as e:
+            logger.error(f"Ошибка отклонения запроса {user_id}: {e}")
 
 @dp.message(Command("start"))
 async def start_command(message: Message, state: FSMContext):
@@ -2884,17 +2953,21 @@ async def show_invite_settings_menu(message: Message, state: FSMContext):
     settings = get_invite_settings()
     
     status = "Включена" if settings["is_enabled"] else "Выключена"
+    auto_status = "Включено" if settings["auto_approve"] else "Выключено"
     chat = settings["chat_id"] or "Не задан"
     last_link = settings["last_invite_link"] or "Не генерировалась"
     
     text = f"Настройка одноразовых приглашений\n\n"
-    text += f"Статус: {status}\n"
+    text += f"Генерация ссылок: {status}\n"
+    text += f"Авто-одобрение: {auto_status}\n"
     text += f"Чат: <code>{chat}</code>\n"
     text += f"Последняя ссылка: {last_link}\n\n"
-    text += "Ссылка будет вставляться в текст одобрения через переменную {invite_link}"
+    text += "Ссылка будет вставляться в текст одобрения через переменную {invite_link}\n"
+    text += "Авто-одобрение: пользователь подаёт заявку на вступление, бот проверяет статус и автоматически одобряет/отклоняет"
     
     keyboard = [
-        [KeyboardButton(text="Включить"), KeyboardButton(text="Выключить")],
+        [KeyboardButton(text="Включить ссылки"), KeyboardButton(text="Выключить ссылки")],
+        [KeyboardButton(text="Включить авто-одобрение"), KeyboardButton(text="Выключить авто-одобрение")],
         [KeyboardButton(text="Задать ID чата")],
         [KeyboardButton(text="Сгенерировать новую ссылку")],
         [KeyboardButton(text="Показать текущую ссылку")],
@@ -2914,16 +2987,30 @@ async def handle_invite_settings(message: Message, state: FSMContext, msg_text: 
     if msg_text == "Назад в меню":
         await start_command(message, state)
         return
-    elif msg_text == "Включить":
+    elif msg_text == "Включить ссылки":
         if toggle_invite(True, admin_id):
             await message.answer("Генерация ссылок включена")
         else:
             await message.answer("Ошибка включения")
         await show_invite_settings_menu(message, state)
         return
-    elif msg_text == "Выключить":
+    elif msg_text == "Выключить ссылки":
         if toggle_invite(False, admin_id):
             await message.answer("Генерация ссылок выключена")
+        else:
+            await message.answer("Ошибка выключения")
+        await show_invite_settings_menu(message, state)
+        return
+    elif msg_text == "Включить авто-одобрение":
+        if toggle_auto_approve(True, admin_id):
+            await message.answer("Авто-одобрение включено")
+        else:
+            await message.answer("Ошибка включения")
+        await show_invite_settings_menu(message, state)
+        return
+    elif msg_text == "Выключить авто-одобрение":
+        if toggle_auto_approve(False, admin_id):
+            await message.answer("Авто-одобрение выключено")
         else:
             await message.answer("Ошибка выключения")
         await show_invite_settings_menu(message, state)
@@ -3175,7 +3262,7 @@ async def handle_text(message: Message, state: FSMContext):
             elif msg_text == "Настройка приглашений":
                 await show_invite_settings_menu(message, state)
                 return
-            elif msg_text in ["Включить", "Выключить", "Задать ID чата", "Сгенерировать новую ссылку", "Показать текущую ссылку"]:
+            elif msg_text in ["Включить ссылки", "Выключить ссылки", "Включить авто-одобрение", "Выключить авто-одобрение", "Задать ID чата", "Сгенерировать новую ссылку", "Показать текущую ссылку"]:
                 await handle_invite_settings(message, state, msg_text)
                 return
         
@@ -3379,7 +3466,7 @@ async def main():
     
     while True:
         try:
-            await dp.start_polling(bot, timeout=30, relax=0.5, allowed_updates=["message", "callback_query"])
+            await dp.start_polling(bot, timeout=30, relax=0.5, allowed_updates=["message", "callback_query", "chat_join_request"])
         except TelegramNetworkError as e:
             logger.error(f"Ошибка сети: {e}. Перезапуск через 5 секунд...")
             await asyncio.sleep(5)
