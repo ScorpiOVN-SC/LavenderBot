@@ -938,20 +938,20 @@ def check_app_configuration():
         if cursor.fetchone()[0] == 0:
             default_texts = [
                 ("apply_text", 
-                 "Ваша заявка одобрена!\n\nIP сервера: 5.83.140.206:25714\nСсылка для входа: {invite_link}\nhttps://discord.gg/AuKrCmJAaj\n\nСпасибо, что выбрали нас!",
+                 "<b>🎉 Вы приняты!</b>\nВсю информацию о сборке, версии игры, дискорд канале и тд. можете найти в ветке беседы - ‼️ Информация о проекте.\n\n{invite_link}\n\nТак же, перед игрой на сервере вам нужно будет привязать свой дискорд, для безопасности. Как только зайдёте в наш дискорд, напишите свой ник в основной чат, чтобы вам выдали роль игрока\n\nЕсли у вас возникнут вопросы, посмотрите, возможно здесь есть их решение:\nhttps://telegra.ph/Gajd-po-serveru-Lavender-Park-06-30\n\nЖелаем приятной игры!",
                  "HTML", "Текст при одобрении заявки"),
                 ("cancel_text",
-                 "Здравствуйте!\n\nПричина отказа:\n{reason}\n\n{retry_text}\n\nС уважением,\nАдминистрация Lavender Park",
+                 "Благодарим за интерес к нашему серверу и за поданную заявку. Мы внимательно её рассмотрели, но, к сожалению, вы не подходите по критериям проекта.\n\n{reason}\n\n{retry_text}\n\nС уважением,\nАдминистрация Lavender Park",
                  "HTML", "Текст при отказе"),
                 ("welcome_text",
-                 "Добро пожаловать, {name}!\n\nЯ — бот сервера Lavender Park.",
+                 "<b>Добро пожаловать, {name}!</b>\n\nЯ — бот сервера <b><i>Lavender Park</i></b>, твой проводник в мир уютного выживания и дружеского общения.\n\nЧтобы начать, нажми на кнопку ниже и заполни анкету.",
                  "HTML", "Приветственный текст"),
                 ("admin_welcome_text",
-                 "Здравствуйте, {name}!\n\nЗаявок на проверку: {count}",
-                 "HTML", "Приветственный текст для админов"),
+                 "*Здравствуйте, {name}!*\n\n_У вас {count} анкет_",
+                 "Markdown", "Приветственный текст для админов"),
                 ("server_info_text",
-                 "Наши фишки:\n1. Уникальные моды\n2. Голосовой чат\n3. Последняя версия\n4. Дружное сообщество",
-                 "HTML", "Информация о сервере"),
+                 "*⊹⋗⊹ ⲙ ⲟ ⲇ ы  +  ⲗ ⲟ ⲣ ⊹⋗⊹*\n| _На нашем сервере_\n| _используются уникальные_\n| _кастомные моды, расширяющие_\n| _возможности выживания._\n\n*Почему стоит остаться?*\n• Дружное комьюнити\n• Активная администрация\n• Регулярные обновления\n• Уютная атмосфера",
+                 "Markdown", "Информация о сервере"),
                 ("already_applied_text",
                  "Вашу заявку уже одобрили",
                  "HTML", "Текст если заявка уже одобрена"),
@@ -965,7 +965,7 @@ def check_app_configuration():
                  "Ты уже отправил заявку",
                  "HTML", "Текст если заявка уже отправлена"),
                 ("final_cancel_text",
-                 "Здравствуйте!\n\nПричина отказа:\n{reason}\n\nЭто окончательное решение администрации. Вы не можете подать заявку повторно.\n\nС уважением,\nАдминистрация Lavender Park",
+                 "Благодарим за интерес к нашему серверу и за поданную заявку. Мы внимательно её рассмотрели, но, к сожалению, вы не подходите по критериям проекта.\n\n{reason}\n\nЭто окончательное решение администрации. Вы не можете подать заявку повторно.\n\nС уважением,\nАдминистрация Lavender Park",
                  "HTML", "Текст при окончательном отказе"),
                 ("welcome_to_chat_text",
                  "🎉 Добро пожаловать, {name}!\n\nМы рады приветствовать вас на сервере Lavender Park!\n\nОбязательно ознакомьтесь с правилами в закреплённом сообщении.",
@@ -1168,14 +1168,12 @@ async def start_command(message: Message, state: FSMContext):
     else:
         keyboard = [
             [KeyboardButton(text="Начать проверку")],
-            [KeyboardButton(text="Отказанные заявки")],
-            [KeyboardButton(text="Одобренные заявки")],
+            [KeyboardButton(text="Отказанные"), KeyboardButton(text="Одобренные")],
         ]
         
         if is_main_admin(user_id):
-            keyboard.append([KeyboardButton(text="Управление вопросами")])
-            keyboard.append([KeyboardButton(text="Управление текстами")])
-            keyboard.append([KeyboardButton(text="Управление админами")])
+            keyboard.append([KeyboardButton(text="Вопросы"), KeyboardButton(text="Тексты")])
+            keyboard.append([KeyboardButton(text="Админы")])
             keyboard.append([KeyboardButton(text="Черный список")])
             keyboard.append([KeyboardButton(text="Шаблоны отказа")])
             keyboard.append([KeyboardButton(text="Настройка приглашений")])
@@ -3208,10 +3206,10 @@ async def handle_text(message: Message, state: FSMContext):
         if msg_text == "Начать проверку":
             await check_applications(message, state)
             return
-        elif msg_text == "Отказанные заявки":
+        elif msg_text == "Отказанные":
             await show_rejected_applications(message, state)
             return
-        elif msg_text == "Одобренные заявки":
+        elif msg_text == "Одобренные":
             await show_applied_applications(message, state)
             return
         elif msg_text == "Назад в меню":
@@ -3222,41 +3220,20 @@ async def handle_text(message: Message, state: FSMContext):
             return
         
         if is_main_admin(user_id):
-            if msg_text == "Управление вопросами":
+            if msg_text == "Вопросы":
                 await manage_questions_menu(message, state)
                 return
-            elif msg_text == "Управление текстами":
+            elif msg_text == "Тексты":
                 await manage_texts_menu(message, state)
                 return
-            elif msg_text == "Управление админами":
+            elif msg_text == "Админы":
                 await show_admin_management(message, state)
-                return
-            elif msg_text == "Добавить админа":
-                await handle_add_admin(message, state)
-                return
-            elif msg_text == "Удалить админа":
-                await handle_remove_admin(message, state)
                 return
             elif msg_text == "Черный список":
                 await show_blacklist_menu(message, state)
                 return
-            elif msg_text == "Добавить в черный список":
-                await handle_blacklist_add(message, state)
-                return
-            elif msg_text == "Удалить из черного списка":
-                await handle_blacklist_remove(message, state)
-                return
-            elif msg_text == "Найти в черном списке":
-                await search_blacklist(message, state)
-                return
             elif msg_text == "Шаблоны отказа":
                 await show_templates_menu(message, state)
-                return
-            elif msg_text == "Добавить шаблон":
-                await handle_template_add(message, state)
-                return
-            elif msg_text == "Удалить шаблон":
-                await handle_template_delete(message, state)
                 return
             elif msg_text == "Настройка приглашений":
                 await show_invite_settings_menu(message, state)
