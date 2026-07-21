@@ -602,29 +602,33 @@ def set_invite_chat(chat_id, admin_id):
         logger.error(f"Ошибка установки чата: {e}")
         return False
 
-def toggle_invite(enable: bool, admin_id):
+def toggle_invite(admin_id):
     try:
+        settings = get_invite_settings()
+        new_state = 0 if settings["is_enabled"] else 1
         db_execute(
             "UPDATE invite_settings SET is_enabled = ?, updated_by = ?",
-            (1 if enable else 0, admin_id)
+            (new_state, admin_id)
         )
-        logger.info(f"Админ {admin_id} {'включил' if enable else 'выключил'} генерацию ссылок")
-        return True
+        logger.info(f"Админ {admin_id} {'включил' if new_state else 'выключил'} генерацию ссылок")
+        return new_state
     except Exception as e:
         logger.error(f"Ошибка переключения: {e}")
-        return False
+        return None
 
-def toggle_auto_approve(enable: bool, admin_id):
+def toggle_auto_approve(admin_id):
     try:
+        settings = get_invite_settings()
+        new_state = 0 if settings["auto_approve"] else 1
         db_execute(
             "UPDATE invite_settings SET auto_approve = ?, updated_by = ?",
-            (1 if enable else 0, admin_id)
+            (new_state, admin_id)
         )
-        logger.info(f"Админ {admin_id} {'включил' if enable else 'выключил'} авто-одобрение")
-        return True
+        logger.info(f"Админ {admin_id} {'включил' if new_state else 'выключил'} авто-одобрение")
+        return new_state
     except Exception as e:
         logger.error(f"Ошибка переключения авто-одобрения: {e}")
-        return False
+        return None
 
 async def generate_invite_link_for_user(user_id: int) -> str:
     settings = get_invite_settings()
@@ -653,7 +657,7 @@ async def generate_invite_link_for_user(user_id: int) -> str:
             (link,)
         )
         
-        logger.info(f"Создана ссылка для пользователя {user_id}: {link}")
+        logger.info(f"Создана ссылка для пользователя {user_id}: {link} (creates_join_request={settings['auto_approve']})")
         return link
         
     except Exception as e:
@@ -962,7 +966,10 @@ def check_app_configuration():
                  "HTML", "Текст если заявка уже отправлена"),
                 ("final_cancel_text",
                  "Здравствуйте!\n\nПричина отказа:\n{reason}\n\nЭто окончательное решение администрации. Вы не можете подать заявку повторно.\n\nС уважением,\nАдминистрация Lavender Park",
-                 "HTML", "Текст при окончательном отказе")
+                 "HTML", "Текст при окончательном отказе"),
+                ("welcome_to_chat_text",
+                 "🎉 Добро пожаловать, {name}!\n\nМы рады приветствовать вас на сервере Lavender Park!\n\nОбязательно ознакомьтесь с правилами в закреплённом сообщении.",
+                 "HTML", "Приветствие при вступлении в чат")
             ]
             cursor.executemany(
                 "INSERT INTO texts (text_key, text_content, parse_mode, description) VALUES (?, ?, ?, ?)",
@@ -1076,8 +1083,7 @@ async def handle_join_request(request: ChatJoinRequest):
     settings = get_invite_settings()
     
     if not settings["auto_approve"]:
-        logger.info(f"Авто-одобрение отключено, запрос от {request.from_user.id} отклонён")
-        await request.decline()
+        logger.info(f"Авто-одобрение отключено, запрос от {request.from_user.id} игнорируется")
         return
     
     user_id = request.from_user.id
@@ -1102,12 +1108,18 @@ async def handle_join_request(request: ChatJoinRequest):
             logger.info(f"✅ Запрос пользователя {user_id} одобрен автоматически")
             
             try:
+                user = await bot.get_chat(user_id)
+                name = user.first_name or "Пользователь"
+                
+                welcome_text, _ = get_text("welcome_to_chat_text", name=escape_html(name))
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"🎉 Добро пожаловать! Пользователь {request.from_user.first_name} присоединился по одноразовой ссылке."
+                    text=welcome_text,
+                    parse_mode="HTML"
                 )
-            except:
-                pass
+                logger.info(f"Приветствие отправлено для {user_id}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки приветствия: {e}")
         except Exception as e:
             logger.error(f"Ошибка одобрения запроса {user_id}: {e}")
     else:
@@ -2966,8 +2978,7 @@ async def show_invite_settings_menu(message: Message, state: FSMContext):
     text += "Авто-одобрение: пользователь подаёт заявку на вступление, бот проверяет статус и автоматически одобряет/отклоняет"
     
     keyboard = [
-        [KeyboardButton(text="Включить ссылки"), KeyboardButton(text="Выключить ссылки")],
-        [KeyboardButton(text="Включить авто-одобрение"), KeyboardButton(text="Выключить авто-одобрение")],
+        [KeyboardButton(text=f"{'Выключить' if settings['is_enabled'] else 'Включить'} ссылки"), KeyboardButton(text=f"{'Выключить' if settings['auto_approve'] else 'Включить'} авто-одобрение")],
         [KeyboardButton(text="Задать ID чата")],
         [KeyboardButton(text="Сгенерировать новую ссылку")],
         [KeyboardButton(text="Показать текущую ссылку")],
@@ -2987,32 +2998,20 @@ async def handle_invite_settings(message: Message, state: FSMContext, msg_text: 
     if msg_text == "Назад в меню":
         await start_command(message, state)
         return
-    elif msg_text == "Включить ссылки":
-        if toggle_invite(True, admin_id):
-            await message.answer("Генерация ссылок включена")
+    elif msg_text in ["Включить ссылки", "Выключить ссылки"]:
+        new_state = toggle_invite(admin_id)
+        if new_state is not None:
+            await message.answer(f"Генерация ссылок {'включена' if new_state else 'выключена'}")
         else:
-            await message.answer("Ошибка включения")
+            await message.answer("Ошибка переключения")
         await show_invite_settings_menu(message, state)
         return
-    elif msg_text == "Выключить ссылки":
-        if toggle_invite(False, admin_id):
-            await message.answer("Генерация ссылок выключена")
+    elif msg_text in ["Включить авто-одобрение", "Выключить авто-одобрение"]:
+        new_state = toggle_auto_approve(admin_id)
+        if new_state is not None:
+            await message.answer(f"Авто-одобрение {'включено' if new_state else 'выключено'}")
         else:
-            await message.answer("Ошибка выключения")
-        await show_invite_settings_menu(message, state)
-        return
-    elif msg_text == "Включить авто-одобрение":
-        if toggle_auto_approve(True, admin_id):
-            await message.answer("Авто-одобрение включено")
-        else:
-            await message.answer("Ошибка включения")
-        await show_invite_settings_menu(message, state)
-        return
-    elif msg_text == "Выключить авто-одобрение":
-        if toggle_auto_approve(False, admin_id):
-            await message.answer("Авто-одобрение выключено")
-        else:
-            await message.answer("Ошибка выключения")
+            await message.answer("Ошибка переключения")
         await show_invite_settings_menu(message, state)
         return
     elif msg_text == "Задать ID чата":
