@@ -2167,39 +2167,41 @@ async def show_next_application(message: Message, state: FSMContext):
     admin_id = message.from_user.id
     try:
         current_user_id = (await state.get_data()).get("check_user_id")
+        
+        current_app_id = None
         if current_user_id:
             if current_user_id in auto_unlock_tasks:
                 auto_unlock_tasks[current_user_id].cancel()
                 del auto_unlock_tasks[current_user_id]
+            
+            current_app_result = db_execute("SELECT id FROM applications WHERE user = ?", (current_user_id,), fetch=True)
+            if current_app_result:
+                current_app_id = current_app_result[0]
+            
             unlock_application(current_user_id)
         
-        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
+        if current_app_id:
+            result = db_execute("SELECT * FROM applications WHERE state = 'sended' AND id > ? ORDER BY id LIMIT 1", (current_app_id,), fetch=True)
+        else:
+            result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id LIMIT 1", fetch=True)
+        
         if not result:
             await message.answer(text="У вас нет заявок")
             await start_command(message, state)
             return
-
-        app_data = None
-        for app in result:
-            user_id = app[1]
-            locked_by = is_application_locked(user_id)
-            if locked_by is None:
-                lock_application(user_id, admin_id)
-                app_data = app
-                break
-            elif locked_by == admin_id:
-                app_data = app
-                break
         
-        if app_data is None:
-            await message.answer("Все заявки уже просматривают другие админы")
+        user_id = result[1]
+        locked_by = is_application_locked(user_id)
+        if locked_by is not None and locked_by != admin_id:
+            await message.answer("Следующая заявка уже просматривается другим админом. Попробуйте позже.")
             await start_command(message, state)
             return
-
-        app_id = app_data[0]
-        user_id = app_data[1]
-        tag = app_data[2] or "Нет тега"
-        answers_json = app_data[5] if len(app_data) > 5 else "{}"
+        
+        lock_application(user_id, admin_id)
+        
+        app_id = result[0]
+        tag = result[2] or "Нет тега"
+        answers_json = result[5] if len(result) > 5 else "{}"
         
         await state.update_data(check_user_id=user_id)
         
@@ -2225,23 +2227,12 @@ async def show_next_application(message: Message, state: FSMContext):
         
         user_link = format_user_link(user_id, tag)
         
-        account_warning = await get_account_age_and_warning(user_id)
-        
-        app_index = 1
-        for i, app in enumerate(result):
-            if app[0] == app_id:
-                app_index = i + 1
-                break
-        
         check_text_parts = [
-            f"Заявка {app_index} из {len(result)}",
+            f"Заявка",
             f"ID: <code>{app_id}</code>",
             f"Пользователь: {user_link}",
             f"User ID: <code>{user_id}</code>",
         ]
-        
-        if account_warning:
-            check_text_parts.append(f"{account_warning}")
         
         warning = get_reapply_warning(user_id)
         if warning:
@@ -2256,7 +2247,8 @@ async def show_next_application(message: Message, state: FSMContext):
         check_text_parts.append("\nУ вас есть 5 минут на рассмотрение")
         
         await message.answer(text="\n\n".join(check_text_parts), reply_markup=markup, parse_mode="HTML")
-        logger.info(f"Админ {admin_id} перешел к следующей заявке")
+        logger.info(f"Админ {admin_id} перешел к следующей заявке (ID: {app_id})")
+        
     except Exception as e:
         logger.error(f"Ошибка показа следующей заявки: {e}")
         await message.answer(text="Произошла ошибка")
