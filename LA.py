@@ -76,8 +76,7 @@ class Form(StatesGroup):
     waiting_for_decline_choice = State()
     waiting_for_new_admin = State()
     waiting_for_remove_admin = State()
-    waiting_for_rejected_search = State()
-    waiting_for_applied_search = State()
+    waiting_for_search_applications = State()
     waiting_for_blacklist_add = State()
     waiting_for_blacklist_remove = State()
     waiting_for_blacklist_search = State()
@@ -766,6 +765,34 @@ async def get_account_age_and_warning(user_id: int):
         logger.error(f"Ошибка получения возраста аккаунта {user_id}: {e}")
         return None
 
+def get_applications_settings():
+    try:
+        result = db_execute(
+            "SELECT is_open FROM applications_settings LIMIT 1",
+            fetch=True
+        )
+        if result:
+            return {
+                "is_open": bool(result[0])
+            }
+    except Exception as e:
+        logger.error(f"Ошибка получения настроек заявок: {e}")
+    return {"is_open": True}
+
+def toggle_applications(admin_id):
+    try:
+        settings = get_applications_settings()
+        new_state = 0 if settings["is_open"] else 1
+        db_execute(
+            "UPDATE applications_settings SET is_open = ?, updated_by = ?",
+            (new_state, admin_id)
+        )
+        logger.info(f"Админ {admin_id} {'открыл' if new_state else 'закрыл'} подачу заявок")
+        return new_state
+    except Exception as e:
+        logger.error(f"Ошибка переключения заявок: {e}")
+        return None
+
 def check_app_configuration():
     try:
         ensure_db_directory()
@@ -916,6 +943,20 @@ def check_app_configuration():
             )
             logger.info("Создана запись настроек приглашений")
         
+        cursor.execute('''CREATE TABLE IF NOT EXISTS applications_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            is_open INTEGER DEFAULT 1,
+            updated_by INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        cursor.execute("SELECT COUNT(*) FROM applications_settings")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(
+                "INSERT INTO applications_settings (is_open) VALUES (1)"
+            )
+            logger.info("Создана запись настроек заявок")
+        
         for main_admin in MAIN_ADMINS:
             cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (main_admin,))
         
@@ -944,6 +985,17 @@ def check_app_configuration():
                  'Приветствие при вступлении в чат')
             )
             logger.info("Добавлен текст welcome_to_chat_text")
+        
+        cursor.execute("SELECT COUNT(*) FROM texts WHERE text_key = 'applications_closed_text'")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(
+                "INSERT INTO texts (text_key, text_content, parse_mode, description) VALUES (?, ?, ?, ?)",
+                ('applications_closed_text', 
+                 '🔒 <b>Приём заявок временно закрыт!</b>\n\nМы уже набрали достаточное количество игроков и сейчас проводим внутренние работы.\n\nСледите за новостями в нашем Telegram-канале, чтобы узнать, когда набор откроется снова.', 
+                 'HTML', 
+                 'Текст при закрытии заявок')
+            )
+            logger.info("Добавлен текст applications_closed_text")
 
         cursor.execute("SELECT COUNT(*) FROM texts")
         if cursor.fetchone()[0] == 0:
@@ -980,7 +1032,10 @@ def check_app_configuration():
                  "HTML", "Текст при окончательном отказе"),
                 ("welcome_to_chat_text",
                  "🎉 Добро пожаловать, {name}!\n\nМы рады приветствовать вас на сервере Lavender Park!\n\nОбязательно ознакомьтесь с правилами в закреплённом сообщении.",
-                 "HTML", "Приветствие при вступлении в чат")
+                 "HTML", "Приветствие при вступлении в чат"),
+                ("applications_closed_text",
+                 "🔒 <b>Приём заявок временно закрыт!</b>\n\nМы уже набрали достаточное количество игроков и сейчас проводим внутренние работы.\n\nСледите за новостями в нашем Telegram-канале, чтобы узнать, когда набор откроется снова.",
+                 "HTML", "Текст при закрытии заявок")
             ]
             cursor.executemany(
                 "INSERT INTO texts (text_key, text_content, parse_mode, description) VALUES (?, ?, ?, ?)",
@@ -1157,29 +1212,40 @@ async def start_command(message: Message, state: FSMContext):
         except Exception as e:
             logger.error(f"Ошибка в start для {user_id}: {e}")
 
+        settings = get_applications_settings()
+        
         keyboard = [
-            [KeyboardButton(text="Подать заявку")],
             [KeyboardButton(text="О сервере")]
         ]
-
-        try:
-            result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
-            if result:
-                state_db = result[0]
-                if state_db in ["sended", "applied", "canceled"]:
-                    keyboard.append([KeyboardButton(text="Информация о заявке")])
-                
-                if state_db == "applied":
-                    keyboard.append([KeyboardButton(text="🔗 Получить ссылку")])
-        except:
-            pass
+        
+        result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
+        
+        if settings["is_open"]:
+            if result and result[0] == "applied":
+                keyboard.insert(0, [KeyboardButton(text="🔗 Получить ссылку")])
+                keyboard.append([KeyboardButton(text="Информация о заявке")])
+            elif result and result[0] == "sended" or result and result[0] == "canceled":
+                keyboard.append([KeyboardButton(text="Информация о заявке")])
+                if result and result[0] == "sended":
+                    keyboard.insert(0, [KeyboardButton(text="Подать заявку")])
+            else:
+                keyboard.insert(0, [KeyboardButton(text="Подать заявку")])
+        else:
+            if result and result[0] in ["sended", "applied", "canceled"]:
+                keyboard.append([KeyboardButton(text="Информация о заявке")])
+            if result and result[0] == "applied":
+                keyboard.insert(0, [KeyboardButton(text="🔗 Получить ссылку")])
 
         markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        await send_formatted_message(message, "welcome_text", reply_markup=markup, name=message.from_user.first_name or "Пользователь")
+        
+        if not settings["is_open"] and (not result or result[0] not in ["sended", "applied", "canceled"]):
+            await send_formatted_message(message, "applications_closed_text", reply_markup=markup)
+        else:
+            await send_formatted_message(message, "welcome_text", reply_markup=markup, name=message.from_user.first_name or "Пользователь")
     else:
         keyboard = [
             [KeyboardButton(text="Начать проверку")],
-            [KeyboardButton(text="Отказанные"), KeyboardButton(text="Одобренные")],
+            [KeyboardButton(text="Поиск заявок")],
         ]
         
         if is_main_admin(user_id):
@@ -1188,6 +1254,7 @@ async def start_command(message: Message, state: FSMContext):
             keyboard.append([KeyboardButton(text="Черный список")])
             keyboard.append([KeyboardButton(text="Шаблоны отказа")])
             keyboard.append([KeyboardButton(text="Настройка приглашений")])
+            keyboard.append([KeyboardButton(text="Настройка заявок")])
         
         markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -1203,6 +1270,12 @@ async def start_command(message: Message, state: FSMContext):
 async def go_command(message: Message, state: FSMContext):
     if not is_private_chat(message):
         return
+    
+    settings = get_applications_settings()
+    if not settings["is_open"]:
+        await send_formatted_message(message, "applications_closed_text")
+        return
+    
     await start_application(message, state)
 
 @dp.message(Command("info"))
@@ -1650,152 +1723,65 @@ async def process_template_delete(message: Message, state: FSMContext):
     await state.clear()
     await show_templates_menu(message, state)
 
-async def show_rejected_applications(message: Message, state: FSMContext):
-    try:
-        user_id = message.from_user.id
-        logger.info(f"Админ {user_id} запросил поиск отклоненных заявок")
-        
-        await state.set_state(Form.waiting_for_rejected_search)
-        markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Назад в меню")]], resize_keyboard=True)
-        await message.answer(
-            "Введите тег или ID пользователя для поиска отклоненной заявки:",
-            reply_markup=markup
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка поиска отклоненных заявок: {e}")
-        await message.answer("Произошла ошибка")
+async def show_search_applications(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав")
+        return
+    
+    await state.set_state(Form.waiting_for_search_applications)
+    markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Назад в меню")]], resize_keyboard=True)
+    await message.answer(
+        "🔍 Введите данные для поиска заявки:\n\n"
+        "Поддерживается поиск по:\n"
+        "• ID пользователя (число)\n"
+        "• @тег пользователя\n"
+        "• Никнейму (часть ника)\n"
+        "• ID заявки (число)",
+        reply_markup=markup
+    )
 
-async def show_applied_applications(message: Message, state: FSMContext):
-    try:
-        user_id = message.from_user.id
-        logger.info(f"Админ {user_id} запросил поиск одобренных заявок")
-        
-        await state.set_state(Form.waiting_for_applied_search)
-        markup = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Назад в меню")]], resize_keyboard=True)
-        await message.answer(
-            "Введите тег, ID пользователя или ник для поиска одобренной заявки:",
-            reply_markup=markup
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка поиска одобренных заявок: {e}")
-        await message.answer("Произошла ошибка")
-
-async def process_rejected_search(message: Message, state: FSMContext):
+async def process_search_applications(message: Message, state: FSMContext):
     if message.text == "Назад в меню":
         await start_command(message, state)
         return
     
     search = message.text.strip()
+    admin_id = message.from_user.id
     
     try:
+        results = []
+        
         if search.startswith("@"):
             tag = search[1:]
-            result = db_execute("""
-                SELECT user, tag, comment, answers, reviewed_by, reviewed_at
+            results = db_execute("""
+                SELECT id, user, tag, state, comment, answers, created_at, reviewed_by, reviewed_at
                 FROM applications 
-                WHERE state = 'canceled' AND tag = ?
+                WHERE tag = ?
                 ORDER BY id DESC
-            """, (tag,), fetch=True)
+                LIMIT 20
+            """, (tag,), fetchall=True)
         else:
             try:
                 user_id = int(search)
-                result = db_execute("""
-                    SELECT user, tag, comment, answers, reviewed_by, reviewed_at
+                results = db_execute("""
+                    SELECT id, user, tag, state, comment, answers, created_at, reviewed_by, reviewed_at
                     FROM applications 
-                    WHERE state = 'canceled' AND user = ?
-                """, (user_id,), fetch=True)
-            except ValueError:
-                await message.answer("Неверный формат. Введите @тег или ID пользователя.")
-                return
-        
-        if not result:
-            await message.answer(
-                f"Заявок не найдено для {search}",
-                reply_markup=ReplyKeyboardMarkup(
-                    keyboard=[[KeyboardButton(text="Назад в меню")]],
-                    resize_keyboard=True
-                )
-            )
-            return
-        
-        uid, tag, comment, answers_json, reviewed_by, reviewed_at = result
-        user_display = format_user_link(uid, tag)
-        
-        text = f"Отказанная заявка\n\n"
-        text += f"Пользователь: {user_display}\n"
-        text += f"ID: <code>{uid}</code>\n"
-        if comment:
-            text += f"Причина: {escape_html(comment)}\n"
-        if reviewed_by:
-            admin_result = db_execute("SELECT tag FROM admins WHERE user_id = ?", (reviewed_by,), fetch=True)
-            admin_tag = admin_result[0] if admin_result else None
-            if admin_tag:
-                text += f"Отклонил: @{escape_html(admin_tag)}\n"
-            else:
-                text += f"Отклонил: <code>{reviewed_by}</code>\n"
-        if reviewed_at:
-            text += f"Время: {reviewed_at}\n"
-        
-        text += "\n"
-        try:
-            answers = json.loads(answers_json) if answers_json else {}
-            questions = get_questions()
-            for q_key, q_text, display_text in questions:
-                answer = answers.get(q_key, "Не заполнено")
-                display = display_text.replace("{answer}", escape_html(str(answer)))
-                text += f"{display}\n"
-        except:
-            text += "Нет данных\n"
-        
-        keyboard = [
-            [KeyboardButton(text=f"+ Дать попытку {uid}")],
-            [KeyboardButton(text="Назад в меню")]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        
-        await message.answer(text, reply_markup=markup, parse_mode="HTML")
-        
-    except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
-        await message.answer("Произошла ошибка при поиске")
-
-async def process_applied_search(message: Message, state: FSMContext):
-    if message.text == "Назад в меню":
-        await start_command(message, state)
-        return
-    
-    search = message.text.strip()
-    
-    try:
-        if search.startswith("@"):
-            tag = search[1:]
-            result = db_execute("""
-                SELECT user, tag, answers, reviewed_by, reviewed_at
-                FROM applications 
-                WHERE state = 'applied' AND tag = ?
-                ORDER BY id DESC
-            """, (tag,), fetch=True)
-        else:
-            try:
-                user_id = int(search)
-                result = db_execute("""
-                    SELECT user, tag, answers, reviewed_by, reviewed_at
-                    FROM applications 
-                    WHERE state = 'applied' AND user = ?
-                """, (user_id,), fetch=True)
-            except ValueError:
-                result = db_execute("""
-                    SELECT user, tag, answers, reviewed_by, reviewed_at
-                    FROM applications 
-                    WHERE state = 'applied' AND answers LIKE ?
+                    WHERE user = ? OR id = ?
                     ORDER BY id DESC
-                """, (f'%{search}%',), fetch=True)
+                    LIMIT 20
+                """, (user_id, user_id), fetchall=True)
+            except ValueError:
+                results = db_execute("""
+                    SELECT id, user, tag, state, comment, answers, created_at, reviewed_by, reviewed_at
+                    FROM applications 
+                    WHERE answers LIKE ?
+                    ORDER BY id DESC
+                    LIMIT 20
+                """, (f'%{search}%',), fetchall=True)
         
-        if not result:
+        if not results:
             await message.answer(
-                f"Заявок не найдено для {search}",
+                f"❌ Заявок не найдено для: {search}",
                 reply_markup=ReplyKeyboardMarkup(
                     keyboard=[[KeyboardButton(text="Назад в меню")]],
                     resize_keyboard=True
@@ -1803,640 +1789,164 @@ async def process_applied_search(message: Message, state: FSMContext):
             )
             return
         
-        uid, tag, answers_json, reviewed_by, reviewed_at = result
-        user_display = format_user_link(uid, tag)
+        for app in results[:5]:
+            app_id, user_id, tag, state, comment, answers_json, created_at, reviewed_by, reviewed_at = app
+            
+            state_emoji = {
+                "created": "📝",
+                "sended": "📤",
+                "applied": "✅",
+                "canceled": "❌"
+            }.get(state, "❓")
+            
+            state_names = {
+                "created": "Заполняется",
+                "sended": "На проверке",
+                "applied": "Одобрена",
+                "canceled": "Отклонена"
+            }.get(state, state)
+            
+            user_link = format_user_link(user_id, tag)
+            
+            text = f"📋 Заявка #{app_id}\n"
+            text += f"Пользователь: {user_link}\n"
+            text += f"ID: <code>{user_id}</code>\n"
+            text += f"Статус: {state_emoji} {state_names}\n"
+            
+            if comment:
+                text += f"Комментарий: {escape_html(comment[:100])}...\n"
+            
+            if created_at:
+                text += f"Создана: {created_at}\n"
+            
+            if reviewed_by:
+                admin_result = db_execute("SELECT tag FROM admins WHERE user_id = ?", (reviewed_by,), fetch=True)
+                admin_tag = admin_result[0] if admin_result else None
+                if admin_tag:
+                    text += f"Рассмотрел: @{escape_html(admin_tag)}\n"
+                else:
+                    text += f"Рассмотрел: <code>{reviewed_by}</code>\n"
+            
+            if reviewed_at:
+                text += f"Время рассмотрения: {reviewed_at}\n"
+            
+            try:
+                answers = json.loads(answers_json) if answers_json else {}
+                questions = get_questions()
+                text += "\n📝 Ответы:\n"
+                for q_key, q_text, display_text in questions[:3]:
+                    answer = answers.get(q_key, "Не заполнено")
+                    display = display_text.replace("{answer}", escape_html(str(answer)))
+                    text += f"{display}\n"
+                if len(questions) > 3:
+                    text += f"... и еще {len(questions) - 3} вопросов\n"
+            except:
+                pass
+            
+            keyboard = []
+            if state == "sended":
+                keyboard.append([KeyboardButton(text=f"Одобрить #{app_id}")])
+                keyboard.append([KeyboardButton(text=f"Отклонить #{app_id}")])
+            elif state == "canceled":
+                keyboard.append([KeyboardButton(text=f"+ Дать попытку {user_id}")])
+            elif state == "applied":
+                if db_execute("SELECT invite_link FROM applications WHERE user = ?", (user_id,), fetch=True):
+                    keyboard.append([KeyboardButton(text=f"Выдать ссылку {user_id}")])
+            
+            keyboard.append([KeyboardButton(text="Назад в меню")])
+            markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+            
+            await message.answer(text, reply_markup=markup, parse_mode="HTML")
         
-        text = f"Одобренная заявка\n\n"
-        text += f"Пользователь: {user_display}\n"
-        text += f"ID: <code>{uid}</code>\n"
-        if reviewed_by:
-            admin_result = db_execute("SELECT tag FROM admins WHERE user_id = ?", (reviewed_by,), fetch=True)
-            admin_tag = admin_result[0] if admin_result else None
-            if admin_tag:
-                text += f"Одобрил: @{escape_html(admin_tag)}\n"
-            else:
-                text += f"Одобрил: <code>{reviewed_by}</code>\n"
-        if reviewed_at:
-            text += f"Время: {reviewed_at}\n"
-        
-        text += "\n"
-        try:
-            answers = json.loads(answers_json) if answers_json else {}
-            questions = get_questions()
-            for q_key, q_text, display_text in questions:
-                answer = answers.get(q_key, "Не заполнено")
-                display = display_text.replace("{answer}", escape_html(str(answer)))
-                text += f"{display}\n"
-        except:
-            text += "Нет данных\n"
-        
-        keyboard = [
-            [KeyboardButton(text="Назад в меню")]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        
-        await message.answer(text, reply_markup=markup, parse_mode="HTML")
+        if len(results) > 5:
+            await message.answer(f"Показаны первые 5 из {len(results)} найденных заявок. Уточните поиск для более точных результатов.")
         
     except Exception as e:
-        logger.error(f"Ошибка поиска одобренных: {e}")
+        logger.error(f"Ошибка поиска заявок: {e}")
         await message.answer("Произошла ошибка при поиске")
 
-async def add_extra_attempt_from_button(message: Message, button_text: str):
-    try:
-        parts = button_text.split()
-        if len(parts) < 3:
-            await message.answer("Не удалось определить пользователя")
-            return
-        
-        uid = int(parts[2])
-        admin_id = message.from_user.id
-        
-        result = db_execute("SELECT state, tag, comment, answers FROM applications WHERE user = ?", (uid,), fetch=True)
-        if not result:
-            await message.answer(f"Пользователь с ID {uid} не найден")
-            return
-        
-        state, tag, comment, answers = result
-        
-        if state != "canceled":
-            await message.answer(f"Заявка пользователя {uid} не отклонена")
-            return
-        
-        save_to_history(uid, tag, "canceled", comment, answers, admin_id)
-        
-        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("created", uid))
-        
-        logger.info(f"Админ {admin_id} добавил попытку пользователю {uid}")
-        await message.answer(f"Пользователю {uid} добавлена дополнительная попытка\nСтатус заявки сброшен на 'created'")
-        
-        try:
-            await bot.send_message(
-                uid,
-                f"Администратор добавил вам дополнительную попытку подачи заявки!\n"
-                f"Вы можете подать заявку заново, нажав 'Подать заявку' в главном меню."
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить пользователя {uid}: {e}")
-        
-        await start_command(message, state)
-        
-    except ValueError:
-        await message.answer("Неверный формат ID пользователя")
-    except Exception as e:
-        logger.error(f"Ошибка добавления попытки: {e}")
-        await message.answer("Произошла ошибка при добавлении попытки")
-
-async def start_application(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    logger.info(f"Пользователь {user_id} начал заполнение заявки")
-    
-    if is_in_blacklist(user_id):
-        await message.answer(
-            "Вы находитесь в черном списке и не можете подать заявку.\n"
-            "Если считаете это ошибкой, обратитесь к администратору."
-        )
+async def show_applications_settings_menu(message: Message, state: FSMContext):
+    if not is_main_admin(message.from_user.id):
+        await message.answer("У вас нет прав")
         return
     
-    try:
-        db_execute("INSERT OR IGNORE INTO applications (user, tag) VALUES (?, ?)", 
-                  (user_id, message.from_user.username or None))
-    except Exception as e:
-        logger.error(f"Ошибка вставки заявки: {e}")
-
-    try:
-        result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
-        if result:
-            state_db = result[0]
-            if state_db == "applied":
-                await send_formatted_message(message, "already_applied_text")
-                await start_command(message, state)
-                return
-            elif state_db == "canceled":
-                await message.answer(
-                    "Ваша заявка была окончательно отклонена. Вы не можете подать заявку повторно.",
-                    reply_markup=ReplyKeyboardMarkup(
-                        keyboard=[[KeyboardButton(text="Назад в меню")]],
-                        resize_keyboard=True
-                    )
-                )
-                return
-    except Exception as e:
-        logger.error(f"Ошибка проверки состояния заявки: {e}")
-
-    questions = get_questions()
-    answers = get_application_answers(user_id)
+    settings = get_applications_settings()
     
-    if not questions:
-        await message.answer("Нет доступных вопросов для заявки")
-        return
+    status = "🟢 Открыт" if settings["is_open"] else "🔴 Закрыт"
     
-    start_index = 0
-    for i, (q_key, _, _) in enumerate(questions):
-        if q_key not in answers or not answers[q_key]:
-            start_index = i
-            break
-    
-    await state.update_data(application_mode=True, current_question_index=start_index, total_questions=len(questions))
-    await state.set_state(Form.answering_question)
-    
-    await show_question(message, state, "current")
-
-async def show_preview(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    answers = get_application_answers(user_id)
-    questions = get_questions()
-    
-    data = await state.get_data()
-    current_index = data.get("current_question_index", 0)
-    await state.update_data(preview_from_index=current_index)
-    
-    preview_parts = ["Предпросмотр заявки\n"]
-    
-    for i, (q_key, q_text, display_text) in enumerate(questions, 1):
-        answer = answers.get(q_key, "Не заполнено")
-        display = display_text.replace("{answer}", escape_html(str(answer)))
-        preview_parts.append(f"{i}. {display}")
-    
-    preview_parts.append("\nПроверьте данные перед отправкой")
+    text = f"⚙️ Настройка подачи заявок\n\n"
+    text += f"Статус: {status}\n\n"
+    text += "При закрытии подачи заявок:\n"
+    text += "• Новые пользователи не смогут подать заявку\n"
+    text += "• Текст закрытия можно изменить в меню 'Тексты' (ключ: applications_closed_text)\n"
+    text += "• Существующие заявки продолжают обрабатываться"
     
     keyboard = [
-        [KeyboardButton(text="Назад к вопросам")],
-        [KeyboardButton(text="Отправить заявку")],
-        [KeyboardButton(text="Отменить заявку")]
+        [KeyboardButton(text="🟢 Открыть заявки"), KeyboardButton(text="🔴 Закрыть заявки")],
+        [KeyboardButton(text="Назад в меню")]
     ]
     markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
     
-    await message.answer(text="\n".join(preview_parts), reply_markup=markup, parse_mode="HTML")
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
-async def show_question(message: Message, state: FSMContext, direction: str = "next"):
-    user_id = message.from_user.id
-    data = await state.get_data()
-    questions = get_questions()
-    answers = get_application_answers(user_id)
-    
-    current_index = data.get("current_question_index", 0)
-    total = len(questions)
-    
-    if direction == "next":
-        current_index += 1
-    elif direction == "prev":
-        current_index -= 1
-    elif direction == "current":
-        pass
-    elif direction == "restore":
-        current_index = data.get("preview_from_index", 0)
-    
-    if current_index < 0:
-        current_index = 0
-    if current_index >= total:
-        await show_preview(message, state)
+async def handle_applications_settings(message: Message, state: FSMContext, msg_text: str):
+    if not is_main_admin(message.from_user.id):
+        await message.answer("У вас нет прав")
         return
     
-    await state.update_data(current_question_index=current_index)
-    
-    q_key, q_text, _ = questions[current_index]
-    current_answer = answers.get(q_key, "")
-    
-    keyboard = []
-    nav_row = []
-    
-    if current_index > 0:
-        nav_row.append(KeyboardButton(text="Назад"))
-    if current_answer:
-        nav_row.append(KeyboardButton(text="Пропустить"))
-    if nav_row:
-        keyboard.append(nav_row)
-    
-    keyboard.append([KeyboardButton(text="Предпросмотр")])
-    keyboard.append([KeyboardButton(text="Отменить заявку")])
-    
-    markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-    
-    question_text = f"Вопрос {current_index + 1} из {total}\n\n{q_text}"
-    if current_answer:
-        question_text += f"\n\nТекущий ответ: {escape_html(str(current_answer))}"
-    
-    await message.answer(text=question_text, reply_markup=markup, parse_mode="HTML")
-
-async def save_answer_and_continue(message: Message, state: FSMContext, answer: str):
-    user_id = message.from_user.id
-    data = await state.get_data()
-    questions = get_questions()
-    current_index = data.get("current_question_index", 0)
-    
-    q_key, _, _ = questions[current_index]
-    answers = get_application_answers(user_id)
-    answers[q_key] = answer
-    
-    try:
-        db_execute("UPDATE applications SET answers = ? WHERE user = ?", (json.dumps(answers, ensure_ascii=False), user_id))
-        logger.info(f"Пользователь {user_id} сохранил ответ на вопрос {q_key}")
-    except Exception as e:
-        logger.error(f"Ошибка сохранения ответа: {e}")
-        await message.answer("Ошибка при сохранении ответа")
-        return
-    
-    await message.answer(text="Ответ сохранен")
-    await show_question(message, state, "next")
-
-async def submit_application(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    try:
-        answers = get_application_answers(user_id)
-        questions = get_questions()
-        
-        all_answered = True
-        for q_key, _, _ in questions:
-            if q_key not in answers or not answers[q_key]:
-                all_answered = False
-                break
-        
-        if not all_answered:
-            await send_formatted_message(message, "not_all_fields_text")
-            return
-        
-        result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
-        if result and result[0] == "sended":
-            await send_formatted_message(message, "already_sent_text")
-            return
-        elif result and result[0] == "canceled":
-            await message.answer("Ваша заявка была окончательно отклонена")
-            return
-        
-        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("sended", user_id))
-        
-        logger.info(f"Пользователь {user_id} отправил заявку")
-        await send_formatted_message(message, "application_sent_text")
-        await start_command(message, state)
-        
-        for admin in admins:
-            try:
-                await bot.send_message(admin, text="У вас новая заявка!")
-            except:
-                pass
-    except Exception as e:
-        logger.error(f"Ошибка отправки заявки: {e}")
-        await message.answer(text="Произошла ошибка при отправке заявки")
-
-async def check_applications(message: Message, state: FSMContext):
     admin_id = message.from_user.id
-    try:
-        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
-        if not result or len(result) < 1:
-            await message.answer(text="У вас нет заявок")
-            await start_command(message, state)
-            return
-
-        app_data = None
-        for app in result:
-            user_id = app[1]
-            locked_by = is_application_locked(user_id)
-            if locked_by is None:
-                lock_application(user_id, admin_id)
-                app_data = app
-                break
-            elif locked_by == admin_id:
-                app_data = app
-                break
-        
-        if app_data is None:
-            await message.answer("Все заявки уже просматривают другие админы")
-            await start_command(message, state)
-            return
-
-        app_id = app_data[0]
-        user_id = app_data[1]
-        tag = app_data[2] or "Нет тега"
-        answers_json = app_data[5] if len(app_data) > 5 else "{}"
-        
-        await state.update_data(check_user_id=user_id)
-        
-        if user_id in auto_unlock_tasks:
-            auto_unlock_tasks[user_id].cancel()
-        task = asyncio.create_task(auto_unlock_application(user_id, admin_id, message, state))
-        auto_unlock_tasks[user_id] = task
-        
-        keyboard = [
-            [KeyboardButton(text="Одобрить")],
-            [KeyboardButton(text="Отклонить")],
-            [KeyboardButton(text="Следующая")],
-            [KeyboardButton(text="Отмена")]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        
-        try:
-            answers = json.loads(answers_json) if answers_json else {}
-        except:
-            answers = {}
-            
-        questions = get_questions()
-        
-        user_link = format_user_link(user_id, tag)
-        
-        account_warning = await get_account_age_and_warning(user_id)
-        
-        check_text_parts = [
-            f"Заявка",
-            f"ID: <code>{app_id}</code>",
-            f"Пользователь: {user_link}",
-            f"User ID: <code>{user_id}</code>",
-        ]
-        
-        if account_warning:
-            check_text_parts.append(f"{account_warning}")
-        
-        warning = get_reapply_warning(user_id)
-        if warning:
-            check_text_parts.append(f"\n{warning}")
-        
-        for i, (q_key, q_text, display_text) in enumerate(questions, 1):
-            answer = answers.get(q_key, "Не заполнено")
-            safe_answer = escape_html(str(answer))
-            display = display_text.replace("{answer}", safe_answer)
-            check_text_parts.append(display)
-        
-        check_text_parts.append("\nУ вас есть 5 минут на рассмотрение")
-        
-        await message.answer(text="\n\n".join(check_text_parts), reply_markup=markup, parse_mode="HTML")
-        logger.info(f"Админ {admin_id} начал проверку заявки {user_id}")
-    except Exception as e:
-        logger.error(f"Ошибка проверки: {e}")
-        await message.answer(text="Произошла ошибка при проверке заявок")
-
-async def show_next_application(message: Message, state: FSMContext):
-    admin_id = message.from_user.id
-    try:
-        current_user_id = (await state.get_data()).get("check_user_id")
-        
-        current_app_id = None
-        if current_user_id:
-            if current_user_id in auto_unlock_tasks:
-                auto_unlock_tasks[current_user_id].cancel()
-                del auto_unlock_tasks[current_user_id]
-            
-            current_app_result = db_execute("SELECT id FROM applications WHERE user = ?", (current_user_id,), fetch=True)
-            if current_app_result:
-                current_app_id = current_app_result[0]
-            
-            unlock_application(current_user_id)
-        
-        if current_app_id:
-            result = db_execute("SELECT * FROM applications WHERE state = 'sended' AND id > ? ORDER BY id LIMIT 1", (current_app_id,), fetch=True)
-        else:
-            result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id LIMIT 1", fetch=True)
-        
-        if not result:
-            await message.answer(text="У вас нет заявок")
-            await start_command(message, state)
-            return
-        
-        user_id = result[1]
-        locked_by = is_application_locked(user_id)
-        if locked_by is not None and locked_by != admin_id:
-            await message.answer("Следующая заявка уже просматривается другим админом. Попробуйте позже.")
-            await start_command(message, state)
-            return
-        
-        lock_application(user_id, admin_id)
-        
-        app_id = result[0]
-        tag = result[2] or "Нет тега"
-        answers_json = result[5] if len(result) > 5 else "{}"
-        
-        await state.update_data(check_user_id=user_id)
-        
-        if user_id in auto_unlock_tasks:
-            auto_unlock_tasks[user_id].cancel()
-        task = asyncio.create_task(auto_unlock_application(user_id, admin_id, message, state))
-        auto_unlock_tasks[user_id] = task
-        
-        keyboard = [
-            [KeyboardButton(text="Одобрить")],
-            [KeyboardButton(text="Отклонить")],
-            [KeyboardButton(text="Следующая")],
-            [KeyboardButton(text="Отмена")]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        
-        try:
-            answers = json.loads(answers_json) if answers_json else {}
-        except:
-            answers = {}
-            
-        questions = get_questions()
-        
-        user_link = format_user_link(user_id, tag)
-        
-        check_text_parts = [
-            f"Заявка",
-            f"ID: <code>{app_id}</code>",
-            f"Пользователь: {user_link}",
-            f"User ID: <code>{user_id}</code>",
-        ]
-        
-        warning = get_reapply_warning(user_id)
-        if warning:
-            check_text_parts.append(f"\n{warning}")
-        
-        for i, (q_key, q_text, display_text) in enumerate(questions, 1):
-            answer = answers.get(q_key, "Не заполнено")
-            safe_answer = escape_html(str(answer))
-            display = display_text.replace("{answer}", safe_answer)
-            check_text_parts.append(display)
-        
-        check_text_parts.append("\nУ вас есть 5 минут на рассмотрение")
-        
-        await message.answer(text="\n\n".join(check_text_parts), reply_markup=markup, parse_mode="HTML")
-        logger.info(f"Админ {admin_id} перешел к следующей заявке (ID: {app_id})")
-        
-    except Exception as e:
-        logger.error(f"Ошибка показа следующей заявки: {e}")
-        await message.answer(text="Произошла ошибка")
-
-async def decline_application_with_choice(message: Message, state: FSMContext, user_id: int):
-    admin_id = message.from_user.id
-    try:
-        await state.update_data(decline_user_id=user_id)
-        await state.set_state(Form.waiting_for_decline_choice)
-        
-        keyboard = [
-            [KeyboardButton(text="Дать еще попытку")],
-            [KeyboardButton(text="Окончательный отказ")],
-            [KeyboardButton(text="Отмена")]
-        ]
-        
-        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        
-        await message.answer(
-            "Выберите действие после отказа:",
-            reply_markup=markup
-        )
-        logger.info(f"Админ {admin_id} начал отклонение заявки {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка выбора после отказа: {e}")
-        await message.answer("Произошла ошибка")
-
-async def process_decline_choice(message: Message, state: FSMContext):
-    admin_id = message.from_user.id
-    data = await state.get_data()
-    user_id = data.get("decline_user_id")
     
-    if not user_id:
-        await message.answer("Ошибка: пользователь не найден")
+    if msg_text == "Назад в меню":
         await start_command(message, state)
         return
-    
-    result = db_execute("SELECT comment, tag, answers FROM applications WHERE user = ?", (user_id,), fetch=True)
-    comment = result[0] if result else "Без причины"
-    tag = result[1] if result and result[1] else None
-    answers = result[2] if result and result[2] else "{}"
-    
-    if user_id in auto_unlock_tasks:
-        auto_unlock_tasks[user_id].cancel()
-        del auto_unlock_tasks[user_id]
-    
-    if message.text == "Дать еще попытку":
-        save_to_history(user_id, tag, "canceled", comment, answers, admin_id)
-        
-        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("created", user_id))
-        unlock_application(user_id)
-        
-        try:
-            await send_formatted_message_by_id(
-                user_id, 
-                "cancel_text", 
-                reason=escape_html(comment),
-                retry_text="Вы можете подать заявку повторно, нажав 'Подать заявку' в главном меню."
-            )
-        except:
-            pass
-        
-        user_link = format_user_link(user_id, tag)
-        await message.answer(f"Заявка {user_link} отклонена. Пользователь может подать заявку повторно.", parse_mode="HTML")
-        logger.info(f"Админ {admin_id} отклонил заявку {user_id} с возможностью повторной подачи")
-        
-        await notify_admins_about_review(message, user_id, admin_id, "отклонил")
-        
-        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
-        if result and len(result) > 0:
-            await check_applications(message, state)
+    elif msg_text == "🟢 Открыть заявки":
+        new_state = toggle_applications(admin_id)
+        if new_state is not None:
+            await message.answer(f"✅ Подача заявок {'открыта' if new_state else 'закрыта'}")
         else:
-            await start_command(message, state)
-        
-    elif message.text == "Окончательный отказ":
-        save_to_history(user_id, tag, "canceled_final", comment, answers, admin_id)
-        
-        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("canceled", user_id))
-        unlock_application(user_id)
-        
-        now = get_moscow_time().strftime('%Y-%m-%d %H:%M:%S')
-        db_execute("UPDATE applications SET reviewed_by = ?, reviewed_at = ? WHERE user = ?", 
-                   (admin_id, now, user_id))
-        
-        try:
-            await send_formatted_message_by_id(
-                user_id, 
-                "final_cancel_text", 
-                reason=escape_html(comment)
-            )
-        except:
-            pass
-        
-        user_link = format_user_link(user_id, tag)
-        await message.answer(f"Заявка {user_link} окончательно отклонена. Пользователь не может подать заявку повторно.", parse_mode="HTML")
-        logger.info(f"Админ {admin_id} окончательно отклонил заявку {user_id}")
-        
-        await notify_admins_about_review(message, user_id, admin_id, "окончательно отклонил")
-        
-        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
-        if result and len(result) > 0:
-            await check_applications(message, state)
+            await message.answer("❌ Ошибка изменения статуса")
+        await show_applications_settings_menu(message, state)
+        return
+    elif msg_text == "🔴 Закрыть заявки":
+        new_state = toggle_applications(admin_id)
+        if new_state is not None:
+            await message.answer(f"✅ Подача заявок {'открыта' if new_state else 'закрыта'}")
         else:
-            await start_command(message, state)
-        
-    elif message.text == "Отмена":
-        unlock_application(user_id)
-        await start_command(message, state)
+            await message.answer("❌ Ошибка изменения статуса")
+        await show_applications_settings_menu(message, state)
+        return
     else:
-        await message.answer("Пожалуйста, выберите один из вариантов")
+        await show_applications_settings_menu(message, state)
 
-async def approve_application(message: Message, state: FSMContext, user_id: int):
-    admin_id = message.from_user.id
-    try:
-        locked_by = is_application_locked(user_id)
-        if locked_by is not None and locked_by != admin_id:
-            await message.answer("Эта заявка уже обрабатывается другим админом")
-            return
-        
-        if user_id in auto_unlock_tasks:
-            auto_unlock_tasks[user_id].cancel()
-            del auto_unlock_tasks[user_id]
-        
-        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("applied", user_id))
-        unlock_application(user_id)
-        
-        now = get_moscow_time().strftime('%Y-%m-%d %H:%M:%S')
-        db_execute("UPDATE applications SET reviewed_by = ?, reviewed_at = ? WHERE user = ?", 
-                   (admin_id, now, user_id))
-        
-        result = db_execute("SELECT tag FROM applications WHERE user = ?", (user_id,), fetch=True)
-        tag = result[0] if result and result[0] else None
-        user_link = format_user_link(user_id, tag)
-        
-        await message.answer(text=f"Вы одобрили заявку {user_link}", parse_mode="HTML")
-        logger.info(f"Админ {admin_id} одобрил заявку {user_id}")
-        
-        invite_link = await generate_invite_link_for_user(user_id)
-        
-        if invite_link:
-            db_execute("UPDATE applications SET invite_link = ? WHERE user = ?", (invite_link, user_id))
-            try:
-                await send_formatted_message_by_id(
-                    user_id, 
-                    "apply_text", 
-                    invite_link=invite_link
-                )
-                logger.info(f"Пользователю {user_id} отправлена ссылка: {invite_link}")
-            except Exception as e:
-                logger.error(f"Ошибка отправки с ссылкой: {e}")
-                await send_formatted_message_by_id(user_id, "apply_text")
-        else:
-            await send_formatted_message_by_id(user_id, "apply_text")
-        
-        await send_approved_to_group(user_id, admin_id)
-        await notify_admins_about_review(message, user_id, admin_id, "одобрил")
-        
-        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
-        if result and len(result) > 0:
-            await check_applications(message, state)
-        else:
-            await start_command(message, state)
-    except Exception as e:
-        logger.error(f"Ошибка одобрения заявки: {e}")
+async def show_rejected_applications(message: Message, state: FSMContext):
+    await show_search_applications(message, state)
 
-async def decline_application(message: Message, state: FSMContext, user_id: int, reason: str):
-    admin_id = message.from_user.id
+async def show_applied_applications(message: Message, state: FSMContext):
+    await show_search_applications(message, state)
+
+@dp.message(Command("approve"))
+async def manual_approve(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /approve user_id")
+        return
+    
     try:
-        locked_by = is_application_locked(user_id)
-        if locked_by is not None and locked_by != admin_id:
-            await message.answer("Эта заявка уже обрабатывается другим админом")
-            return
-        
-        db_execute("UPDATE applications SET state = ?, comment = ? WHERE user = ?", 
-                  ("canceled", reason, user_id))
-        
-        result = db_execute("SELECT tag FROM applications WHERE user = ?", (user_id,), fetch=True)
-        tag = result[0] if result and result[0] else None
-        user_link = format_user_link(user_id, tag)
-        
-        await message.answer(text=f"Вы отклонили заявку {user_link} по причине:\n{reason}", parse_mode="HTML")
-        logger.info(f"Админ {admin_id} отклонил заявку {user_id}, причина: {reason}")
-        
-        await decline_application_with_choice(message, state, user_id)
-        
-    except Exception as e:
-        logger.error(f"Ошибка отклонения заявки: {e}")
+        user_id = int(parts[1])
+        result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
+        if result and result[0] == "applied":
+            await bot.approve_chat_join_request(
+                chat_id=int(get_invite_settings()["chat_id"]),
+                user_id=user_id
+            )
+            await message.answer(f"✅ Пользователь {user_id} одобрен")
+        else:
+            await message.answer(f"❌ Пользователь {user_id} не найден или не одобрен")
+    except:
+        await message.answer("❌ Неверный ID")
 
 async def manage_questions_menu(message: Message, state: FSMContext):
     if not is_main_admin(message.from_user.id):
@@ -3167,6 +2677,10 @@ async def handle_text(message: Message, state: FSMContext):
         await process_invite_chat_input(message, state)
         return
     
+    if current_state == Form.waiting_for_search_applications:
+        await process_search_applications(message, state)
+        return
+    
     if not is_admin(user_id) and is_user_banned(user_id):
         remaining = (banned_users[user_id] - datetime.now()).seconds
         await message.answer(f"Вы заблокированы. Осталось: {remaining} сек.")
@@ -3209,17 +2723,44 @@ async def handle_text(message: Message, state: FSMContext):
         if msg_text == "Начать проверку":
             await check_applications(message, state)
             return
-        elif msg_text == "Отказанные":
-            await show_rejected_applications(message, state)
-            return
-        elif msg_text == "Одобренные":
-            await show_applied_applications(message, state)
+        elif msg_text == "Поиск заявок":
+            await show_search_applications(message, state)
             return
         elif msg_text == "Назад в меню":
             await start_command(message, state)
             return
         elif msg_text.startswith("+"):
             await add_extra_attempt_from_button(message, msg_text)
+            return
+        elif msg_text.startswith("Одобрить #"):
+            try:
+                app_id = int(msg_text.split("#")[1])
+                result = db_execute("SELECT user FROM applications WHERE id = ?", (app_id,), fetch=True)
+                if result:
+                    await approve_application(message, state, result[0])
+                else:
+                    await message.answer("Заявка не найдена")
+            except:
+                await message.answer("Ошибка")
+            return
+        elif msg_text.startswith("Отклонить #"):
+            try:
+                app_id = int(msg_text.split("#")[1])
+                result = db_execute("SELECT user FROM applications WHERE id = ?", (app_id,), fetch=True)
+                if result:
+                    await state.update_data(decline_user_id=result[0])
+                    await decline_application_with_choice(message, state, result[0])
+                else:
+                    await message.answer("Заявка не найдена")
+            except:
+                await message.answer("Ошибка")
+            return
+        elif msg_text.startswith("Выдать ссылку"):
+            try:
+                uid = int(msg_text.split()[2])
+                await resend_invite_link(message, state, uid)
+            except:
+                await message.answer("Ошибка")
             return
         
         if is_main_admin(user_id):
@@ -3240,6 +2781,12 @@ async def handle_text(message: Message, state: FSMContext):
                 return
             elif msg_text == "Настройка приглашений":
                 await show_invite_settings_menu(message, state)
+                return
+            elif msg_text == "Настройка заявок":
+                await show_applications_settings_menu(message, state)
+                return
+            elif msg_text in ["🟢 Открыть заявки", "🔴 Закрыть заявки"]:
+                await handle_applications_settings(message, state, msg_text)
                 return
             elif msg_text in ["Включить ссылки", "Выключить ссылки", "Включить авто-одобрение", "Выключить авто-одобрение", "Задать ID чата", "Сгенерировать новую ссылку", "Показать текущую ссылку"]:
                 await handle_invite_settings(message, state, msg_text)
@@ -3303,14 +2850,6 @@ async def handle_text(message: Message, state: FSMContext):
     
     if current_state == Form.waiting_for_remove_admin:
         await process_remove_admin(message, state)
-        return
-    
-    if current_state == Form.waiting_for_rejected_search:
-        await process_rejected_search(message, state)
-        return
-    
-    if current_state == Form.waiting_for_applied_search:
-        await process_applied_search(message, state)
         return
     
     if current_state == Form.waiting_for_blacklist_add:
@@ -3377,6 +2916,10 @@ async def handle_text(message: Message, state: FSMContext):
         await send_formatted_message(message, "server_info_text")
         return
     elif msg_text == "Подать заявку":
+        settings = get_applications_settings()
+        if not settings["is_open"]:
+            await send_formatted_message(message, "applications_closed_text")
+            return
         await start_application(message, state)
         return
     elif msg_text == "Информация о заявке":
@@ -3399,10 +2942,7 @@ async def handle_text(message: Message, state: FSMContext):
         elif current_state == Form.waiting_for_comment:
             await start_command(message, state)
             return
-        elif current_state == Form.waiting_for_rejected_search:
-            await start_command(message, state)
-            return
-        elif current_state == Form.waiting_for_applied_search:
+        elif current_state == Form.waiting_for_search_applications:
             await start_command(message, state)
             return
         elif current_state == Form.waiting_for_blacklist_add:
@@ -3426,6 +2966,645 @@ async def handle_text(message: Message, state: FSMContext):
         else:
             await start_command(message, state)
         return
+
+async def resend_invite_link(message: Message, state: FSMContext, user_id: int):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав")
+        return
+    
+    try:
+        result = db_execute("SELECT invite_link, state FROM applications WHERE user = ?", (user_id,), fetch=True)
+        if not result:
+            await message.answer("Пользователь не найден")
+            return
+        
+        invite_link, state = result
+        
+        if state != "applied":
+            await message.answer("Заявка не одобрена")
+            return
+        
+        if not invite_link:
+            invite_link = await generate_invite_link_for_user(user_id)
+            if invite_link:
+                db_execute("UPDATE applications SET invite_link = ? WHERE user = ?", (invite_link, user_id))
+                await message.answer(f"Ссылка сгенерирована для пользователя {user_id}")
+            else:
+                await message.answer("Ошибка генерации ссылки. Проверьте настройки приглашений.")
+                return
+        
+        await send_formatted_message_by_id(
+            user_id,
+            "apply_text",
+            invite_link=invite_link
+        )
+        await message.answer(f"Ссылка отправлена пользователю {user_id}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка повторной отправки ссылки: {e}")
+        await message.answer("Произошла ошибка")
+
+async def start_application(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    logger.info(f"Пользователь {user_id} начал заполнение заявки")
+    
+    if is_in_blacklist(user_id):
+        await message.answer(
+            "Вы находитесь в черном списке и не можете подать заявку.\n"
+            "Если считаете это ошибкой, обратитесь к администратору."
+        )
+        return
+    
+    try:
+        db_execute("INSERT OR IGNORE INTO applications (user, tag) VALUES (?, ?)", 
+                  (user_id, message.from_user.username or None))
+    except Exception as e:
+        logger.error(f"Ошибка вставки заявки: {e}")
+
+    try:
+        result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
+        if result:
+            state_db = result[0]
+            if state_db == "applied":
+                await send_formatted_message(message, "already_applied_text")
+                await start_command(message, state)
+                return
+            elif state_db == "canceled":
+                await message.answer(
+                    "Ваша заявка была окончательно отклонена. Вы не можете подать заявку повторно.",
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[[KeyboardButton(text="Назад в меню")]],
+                        resize_keyboard=True
+                    )
+                )
+                return
+    except Exception as e:
+        logger.error(f"Ошибка проверки состояния заявки: {e}")
+
+    questions = get_questions()
+    answers = get_application_answers(user_id)
+    
+    if not questions:
+        await message.answer("Нет доступных вопросов для заявки")
+        return
+    
+    start_index = 0
+    for i, (q_key, _, _) in enumerate(questions):
+        if q_key not in answers or not answers[q_key]:
+            start_index = i
+            break
+    
+    await state.update_data(application_mode=True, current_question_index=start_index, total_questions=len(questions))
+    await state.set_state(Form.answering_question)
+    
+    await show_question(message, state, "current")
+
+async def show_preview(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    answers = get_application_answers(user_id)
+    questions = get_questions()
+    
+    data = await state.get_data()
+    current_index = data.get("current_question_index", 0)
+    await state.update_data(preview_from_index=current_index)
+    
+    preview_parts = ["Предпросмотр заявки\n"]
+    
+    for i, (q_key, q_text, display_text) in enumerate(questions, 1):
+        answer = answers.get(q_key, "Не заполнено")
+        display = display_text.replace("{answer}", escape_html(str(answer)))
+        preview_parts.append(f"{i}. {display}")
+    
+    preview_parts.append("\nПроверьте данные перед отправкой")
+    
+    keyboard = [
+        [KeyboardButton(text="Назад к вопросам")],
+        [KeyboardButton(text="Отправить заявку")],
+        [KeyboardButton(text="Отменить заявку")]
+    ]
+    markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    
+    await message.answer(text="\n".join(preview_parts), reply_markup=markup, parse_mode="HTML")
+
+async def show_question(message: Message, state: FSMContext, direction: str = "next"):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    questions = get_questions()
+    answers = get_application_answers(user_id)
+    
+    current_index = data.get("current_question_index", 0)
+    total = len(questions)
+    
+    if direction == "next":
+        current_index += 1
+    elif direction == "prev":
+        current_index -= 1
+    elif direction == "current":
+        pass
+    elif direction == "restore":
+        current_index = data.get("preview_from_index", 0)
+    
+    if current_index < 0:
+        current_index = 0
+    if current_index >= total:
+        await show_preview(message, state)
+        return
+    
+    await state.update_data(current_question_index=current_index)
+    
+    q_key, q_text, _ = questions[current_index]
+    current_answer = answers.get(q_key, "")
+    
+    keyboard = []
+    nav_row = []
+    
+    if current_index > 0:
+        nav_row.append(KeyboardButton(text="Назад"))
+    if current_answer:
+        nav_row.append(KeyboardButton(text="Пропустить"))
+    if nav_row:
+        keyboard.append(nav_row)
+    
+    keyboard.append([KeyboardButton(text="Предпросмотр")])
+    keyboard.append([KeyboardButton(text="Отменить заявку")])
+    
+    markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    
+    question_text = f"Вопрос {current_index + 1} из {total}\n\n{q_text}"
+    if current_answer:
+        question_text += f"\n\nТекущий ответ: {escape_html(str(current_answer))}"
+    
+    await message.answer(text=question_text, reply_markup=markup, parse_mode="HTML")
+
+async def save_answer_and_continue(message: Message, state: FSMContext, answer: str):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    questions = get_questions()
+    current_index = data.get("current_question_index", 0)
+    
+    q_key, _, _ = questions[current_index]
+    answers = get_application_answers(user_id)
+    answers[q_key] = answer
+    
+    try:
+        db_execute("UPDATE applications SET answers = ? WHERE user = ?", (json.dumps(answers, ensure_ascii=False), user_id))
+        logger.info(f"Пользователь {user_id} сохранил ответ на вопрос {q_key}")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения ответа: {e}")
+        await message.answer("Ошибка при сохранении ответа")
+        return
+    
+    await message.answer(text="Ответ сохранен")
+    await show_question(message, state, "next")
+
+async def submit_application(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    try:
+        answers = get_application_answers(user_id)
+        questions = get_questions()
+        
+        all_answered = True
+        for q_key, _, _ in questions:
+            if q_key not in answers or not answers[q_key]:
+                all_answered = False
+                break
+        
+        if not all_answered:
+            await send_formatted_message(message, "not_all_fields_text")
+            return
+        
+        result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
+        if result and result[0] == "sended":
+            await send_formatted_message(message, "already_sent_text")
+            return
+        elif result and result[0] == "canceled":
+            await message.answer("Ваша заявка была окончательно отклонена")
+            return
+        
+        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("sended", user_id))
+        
+        logger.info(f"Пользователь {user_id} отправил заявку")
+        await send_formatted_message(message, "application_sent_text")
+        await start_command(message, state)
+        
+        for admin in admins:
+            try:
+                await bot.send_message(admin, text="У вас новая заявка!")
+            except:
+                pass
+    except Exception as e:
+        logger.error(f"Ошибка отправки заявки: {e}")
+        await message.answer(text="Произошла ошибка при отправке заявки")
+
+async def check_applications(message: Message, state: FSMContext):
+    admin_id = message.from_user.id
+    try:
+        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
+        if not result or len(result) < 1:
+            await message.answer(text="У вас нет заявок")
+            await start_command(message, state)
+            return
+
+        app_data = None
+        for app in result:
+            user_id = app[1]
+            locked_by = is_application_locked(user_id)
+            if locked_by is None:
+                lock_application(user_id, admin_id)
+                app_data = app
+                break
+            elif locked_by == admin_id:
+                app_data = app
+                break
+        
+        if app_data is None:
+            await message.answer("Все заявки уже просматривают другие админы")
+            await start_command(message, state)
+            return
+
+        app_id = app_data[0]
+        user_id = app_data[1]
+        tag = app_data[2] or "Нет тега"
+        answers_json = app_data[5] if len(app_data) > 5 else "{}"
+        
+        await state.update_data(check_user_id=user_id)
+        
+        if user_id in auto_unlock_tasks:
+            auto_unlock_tasks[user_id].cancel()
+        task = asyncio.create_task(auto_unlock_application(user_id, admin_id, message, state))
+        auto_unlock_tasks[user_id] = task
+        
+        keyboard = [
+            [KeyboardButton(text="Одобрить")],
+            [KeyboardButton(text="Отклонить")],
+            [KeyboardButton(text="Следующая")],
+            [KeyboardButton(text="Отмена")]
+        ]
+        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+        
+        try:
+            answers = json.loads(answers_json) if answers_json else {}
+        except:
+            answers = {}
+            
+        questions = get_questions()
+        
+        user_link = format_user_link(user_id, tag)
+        
+        account_warning = await get_account_age_and_warning(user_id)
+        
+        check_text_parts = [
+            f"Заявка",
+            f"ID: <code>{app_id}</code>",
+            f"Пользователь: {user_link}",
+            f"User ID: <code>{user_id}</code>",
+        ]
+        
+        if account_warning:
+            check_text_parts.append(f"{account_warning}")
+        
+        warning = get_reapply_warning(user_id)
+        if warning:
+            check_text_parts.append(f"\n{warning}")
+        
+        for i, (q_key, q_text, display_text) in enumerate(questions, 1):
+            answer = answers.get(q_key, "Не заполнено")
+            safe_answer = escape_html(str(answer))
+            display = display_text.replace("{answer}", safe_answer)
+            check_text_parts.append(display)
+        
+        check_text_parts.append("\nУ вас есть 5 минут на рассмотрение")
+        
+        await message.answer(text="\n\n".join(check_text_parts), reply_markup=markup, parse_mode="HTML")
+        logger.info(f"Админ {admin_id} начал проверку заявки {user_id}")
+    except Exception as e:
+        logger.error(f"Ошибка проверки: {e}")
+        await message.answer(text="Произошла ошибка при проверке заявок")
+
+async def show_next_application(message: Message, state: FSMContext):
+    admin_id = message.from_user.id
+    try:
+        current_user_id = (await state.get_data()).get("check_user_id")
+        
+        current_app_id = None
+        if current_user_id:
+            if current_user_id in auto_unlock_tasks:
+                auto_unlock_tasks[current_user_id].cancel()
+                del auto_unlock_tasks[current_user_id]
+            
+            current_app_result = db_execute("SELECT id FROM applications WHERE user = ?", (current_user_id,), fetch=True)
+            if current_app_result:
+                current_app_id = current_app_result[0]
+            
+            unlock_application(current_user_id)
+        
+        if current_app_id:
+            result = db_execute("SELECT * FROM applications WHERE state = 'sended' AND id > ? ORDER BY id LIMIT 1", (current_app_id,), fetch=True)
+        else:
+            result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id LIMIT 1", fetch=True)
+        
+        if not result:
+            await message.answer(text="У вас нет заявок")
+            await start_command(message, state)
+            return
+        
+        user_id = result[1]
+        locked_by = is_application_locked(user_id)
+        if locked_by is not None and locked_by != admin_id:
+            await message.answer("Следующая заявка уже просматривается другим админом. Попробуйте позже.")
+            await start_command(message, state)
+            return
+        
+        lock_application(user_id, admin_id)
+        
+        app_id = result[0]
+        tag = result[2] or "Нет тега"
+        answers_json = result[5] if len(result) > 5 else "{}"
+        
+        await state.update_data(check_user_id=user_id)
+        
+        if user_id in auto_unlock_tasks:
+            auto_unlock_tasks[user_id].cancel()
+        task = asyncio.create_task(auto_unlock_application(user_id, admin_id, message, state))
+        auto_unlock_tasks[user_id] = task
+        
+        keyboard = [
+            [KeyboardButton(text="Одобрить")],
+            [KeyboardButton(text="Отклонить")],
+            [KeyboardButton(text="Следующая")],
+            [KeyboardButton(text="Отмена")]
+        ]
+        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+        
+        try:
+            answers = json.loads(answers_json) if answers_json else {}
+        except:
+            answers = {}
+            
+        questions = get_questions()
+        
+        user_link = format_user_link(user_id, tag)
+        
+        account_warning = await get_account_age_and_warning(user_id)
+        
+        check_text_parts = [
+            f"Заявка",
+            f"ID: <code>{app_id}</code>",
+            f"Пользователь: {user_link}",
+            f"User ID: <code>{user_id}</code>",
+        ]
+        
+        if account_warning:
+            check_text_parts.append(f"{account_warning}")
+        
+        warning = get_reapply_warning(user_id)
+        if warning:
+            check_text_parts.append(f"\n{warning}")
+        
+        for i, (q_key, q_text, display_text) in enumerate(questions, 1):
+            answer = answers.get(q_key, "Не заполнено")
+            safe_answer = escape_html(str(answer))
+            display = display_text.replace("{answer}", safe_answer)
+            check_text_parts.append(display)
+        
+        check_text_parts.append("\nУ вас есть 5 минут на рассмотрение")
+        
+        await message.answer(text="\n\n".join(check_text_parts), reply_markup=markup, parse_mode="HTML")
+        logger.info(f"Админ {admin_id} перешел к следующей заявке (ID: {app_id})")
+        
+    except Exception as e:
+        logger.error(f"Ошибка показа следующей заявки: {e}")
+        await message.answer(text="Произошла ошибка")
+
+async def decline_application_with_choice(message: Message, state: FSMContext, user_id: int):
+    admin_id = message.from_user.id
+    try:
+        await state.update_data(decline_user_id=user_id)
+        await state.set_state(Form.waiting_for_decline_choice)
+        
+        keyboard = [
+            [KeyboardButton(text="Дать еще попытку")],
+            [KeyboardButton(text="Окончательный отказ")],
+            [KeyboardButton(text="Отмена")]
+        ]
+        
+        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+        
+        await message.answer(
+            "Выберите действие после отказа:",
+            reply_markup=markup
+        )
+        logger.info(f"Админ {admin_id} начал отклонение заявки {user_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка выбора после отказа: {e}")
+        await message.answer("Произошла ошибка")
+
+async def process_decline_choice(message: Message, state: FSMContext):
+    admin_id = message.from_user.id
+    data = await state.get_data()
+    user_id = data.get("decline_user_id")
+    
+    if not user_id:
+        await message.answer("Ошибка: пользователь не найден")
+        await start_command(message, state)
+        return
+    
+    result = db_execute("SELECT comment, tag, answers FROM applications WHERE user = ?", (user_id,), fetch=True)
+    comment = result[0] if result else "Без причины"
+    tag = result[1] if result and result[1] else None
+    answers = result[2] if result and result[2] else "{}"
+    
+    if user_id in auto_unlock_tasks:
+        auto_unlock_tasks[user_id].cancel()
+        del auto_unlock_tasks[user_id]
+    
+    if message.text == "Дать еще попытку":
+        save_to_history(user_id, tag, "canceled", comment, answers, admin_id)
+        
+        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("created", user_id))
+        unlock_application(user_id)
+        
+        try:
+            await send_formatted_message_by_id(
+                user_id, 
+                "cancel_text", 
+                reason=escape_html(comment),
+                retry_text="Вы можете подать заявку повторно, нажав 'Подать заявку' в главном меню."
+            )
+        except:
+            pass
+        
+        user_link = format_user_link(user_id, tag)
+        await message.answer(f"Заявка {user_link} отклонена. Пользователь может подать заявку повторно.", parse_mode="HTML")
+        logger.info(f"Админ {admin_id} отклонил заявку {user_id} с возможностью повторной подачи")
+        
+        await notify_admins_about_review(message, user_id, admin_id, "отклонил")
+        
+        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
+        if result and len(result) > 0:
+            await check_applications(message, state)
+        else:
+            await start_command(message, state)
+        
+    elif message.text == "Окончательный отказ":
+        save_to_history(user_id, tag, "canceled_final", comment, answers, admin_id)
+        
+        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("canceled", user_id))
+        unlock_application(user_id)
+        
+        now = get_moscow_time().strftime('%Y-%m-%d %H:%M:%S')
+        db_execute("UPDATE applications SET reviewed_by = ?, reviewed_at = ? WHERE user = ?", 
+                   (admin_id, now, user_id))
+        
+        try:
+            await send_formatted_message_by_id(
+                user_id, 
+                "final_cancel_text", 
+                reason=escape_html(comment)
+            )
+        except:
+            pass
+        
+        user_link = format_user_link(user_id, tag)
+        await message.answer(f"Заявка {user_link} окончательно отклонена. Пользователь не может подать заявку повторно.", parse_mode="HTML")
+        logger.info(f"Админ {admin_id} окончательно отклонил заявку {user_id}")
+        
+        await notify_admins_about_review(message, user_id, admin_id, "окончательно отклонил")
+        
+        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
+        if result and len(result) > 0:
+            await check_applications(message, state)
+        else:
+            await start_command(message, state)
+        
+    elif message.text == "Отмена":
+        unlock_application(user_id)
+        await start_command(message, state)
+    else:
+        await message.answer("Пожалуйста, выберите один из вариантов")
+
+async def approve_application(message: Message, state: FSMContext, user_id: int):
+    admin_id = message.from_user.id
+    try:
+        locked_by = is_application_locked(user_id)
+        if locked_by is not None and locked_by != admin_id:
+            await message.answer("Эта заявка уже обрабатывается другим админом")
+            return
+        
+        if user_id in auto_unlock_tasks:
+            auto_unlock_tasks[user_id].cancel()
+            del auto_unlock_tasks[user_id]
+        
+        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("applied", user_id))
+        unlock_application(user_id)
+        
+        now = get_moscow_time().strftime('%Y-%m-%d %H:%M:%S')
+        db_execute("UPDATE applications SET reviewed_by = ?, reviewed_at = ? WHERE user = ?", 
+                   (admin_id, now, user_id))
+        
+        result = db_execute("SELECT tag FROM applications WHERE user = ?", (user_id,), fetch=True)
+        tag = result[0] if result and result[0] else None
+        user_link = format_user_link(user_id, tag)
+        
+        await message.answer(text=f"Вы одобрили заявку {user_link}", parse_mode="HTML")
+        logger.info(f"Админ {admin_id} одобрил заявку {user_id}")
+        
+        invite_link = await generate_invite_link_for_user(user_id)
+        
+        if invite_link:
+            db_execute("UPDATE applications SET invite_link = ? WHERE user = ?", (invite_link, user_id))
+            try:
+                await send_formatted_message_by_id(
+                    user_id, 
+                    "apply_text", 
+                    invite_link=invite_link
+                )
+                logger.info(f"Пользователю {user_id} отправлена ссылка: {invite_link}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки с ссылкой: {e}")
+                await send_formatted_message_by_id(user_id, "apply_text")
+        else:
+            await send_formatted_message_by_id(user_id, "apply_text")
+        
+        await send_approved_to_group(user_id, admin_id)
+        await notify_admins_about_review(message, user_id, admin_id, "одобрил")
+        
+        result = db_execute("SELECT * FROM applications WHERE state = 'sended' ORDER BY id", fetchall=True)
+        if result and len(result) > 0:
+            await check_applications(message, state)
+        else:
+            await start_command(message, state)
+    except Exception as e:
+        logger.error(f"Ошибка одобрения заявки: {e}")
+
+async def decline_application(message: Message, state: FSMContext, user_id: int, reason: str):
+    admin_id = message.from_user.id
+    try:
+        locked_by = is_application_locked(user_id)
+        if locked_by is not None and locked_by != admin_id:
+            await message.answer("Эта заявка уже обрабатывается другим админом")
+            return
+        
+        db_execute("UPDATE applications SET state = ?, comment = ? WHERE user = ?", 
+                  ("canceled", reason, user_id))
+        
+        result = db_execute("SELECT tag FROM applications WHERE user = ?", (user_id,), fetch=True)
+        tag = result[0] if result and result[0] else None
+        user_link = format_user_link(user_id, tag)
+        
+        await message.answer(text=f"Вы отклонили заявку {user_link} по причине:\n{reason}", parse_mode="HTML")
+        logger.info(f"Админ {admin_id} отклонил заявку {user_id}, причина: {reason}")
+        
+        await decline_application_with_choice(message, state, user_id)
+        
+    except Exception as e:
+        logger.error(f"Ошибка отклонения заявки: {e}")
+
+async def add_extra_attempt_from_button(message: Message, button_text: str):
+    try:
+        parts = button_text.split()
+        if len(parts) < 3:
+            await message.answer("Не удалось определить пользователя")
+            return
+        
+        uid = int(parts[2])
+        admin_id = message.from_user.id
+        
+        result = db_execute("SELECT state, tag, comment, answers FROM applications WHERE user = ?", (uid,), fetch=True)
+        if not result:
+            await message.answer(f"Пользователь с ID {uid} не найден")
+            return
+        
+        state, tag, comment, answers = result
+        
+        if state != "canceled":
+            await message.answer(f"Заявка пользователя {uid} не отклонена")
+            return
+        
+        save_to_history(uid, tag, "canceled", comment, answers, admin_id)
+        
+        db_execute("UPDATE applications SET state = ? WHERE user = ?", ("created", uid))
+        
+        logger.info(f"Админ {admin_id} добавил попытку пользователю {uid}")
+        await message.answer(f"Пользователю {uid} добавлена дополнительная попытка\nСтатус заявки сброшен на 'created'")
+        
+        try:
+            await bot.send_message(
+                uid,
+                f"Администратор добавил вам дополнительную попытку подачи заявки!\n"
+                f"Вы можете подать заявку заново, нажав 'Подать заявку' в главном меню."
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить пользователя {uid}: {e}")
+        
+        await start_command(message, state)
+        
+    except ValueError:
+        await message.answer("Неверный формат ID пользователя")
+    except Exception as e:
+        logger.error(f"Ошибка добавления попытки: {e}")
+        await message.answer("Произошла ошибка при добавлении попытки")
 
 async def main():
     if not check_single_instance():
