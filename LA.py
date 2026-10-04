@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 import sqlite3
 import json
@@ -11,7 +12,15 @@ import logging
 import shutil
 from collections import defaultdict
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types, F
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, ChatJoinRequest
 from aiogram.fsm.context import FSMContext
@@ -21,19 +30,24 @@ from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 
 MAIN_ADMINS = [5479947797, 1301864145]
 token = os.environ.get("API_TOKEN")
-data_folder_path = os.path.dirname(__file__) + "/data"
-LOCK_FILE = "/tmp/lavender_bot.lock"
+data_folder_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+LOCK_FILE = os.environ.get("BOT_LOCK_FILE", "/tmp/lavender_bot.lock")
 
 if not token:
-    raise ValueError("API_TOKEN не задан в переменных окружения")
+    raise ValueError("API_TOKEN не задан в переменных окружения (или в файле .env)")
 
 MAX_MESSAGES_PER_SECOND = 2
 MAX_MESSAGES_PER_MINUTE = 20
 SPAM_BAN_TIME = 300
+REVIEW_TIMEOUT_SECONDS = 300  # время на рассмотрение заявки админом
+APPROVED_GROUP_ID = int(os.environ.get("APPROVED_GROUP_ID", "-1003953845640"))
+APPROVED_TOPIC_ID = int(os.environ.get("APPROVED_TOPIC_ID", "122708"))
+MSK_TZ = ZoneInfo("Europe/Moscow")
 user_messages = defaultdict(list)
 banned_users = {}
 auto_unlock_tasks = {}
 admins = []
+lock_file = None
 
 def setup_logging():
     logs_dir = os.path.join(data_folder_path, "Logs")
@@ -46,8 +60,9 @@ def setup_logging():
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
     
+    log_level = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
@@ -83,6 +98,7 @@ class Form(StatesGroup):
     waiting_for_template_add = State()
     waiting_for_template_delete = State()
     waiting_for_invite_chat = State()
+    waiting_for_format_choice = State()
 
 def is_main_admin(user_id):
     return user_id in MAIN_ADMINS
@@ -110,15 +126,15 @@ def load_admins():
     except Exception as e:
         logger.error(f"Ошибка загрузки админов: {e}")
 
-def add_admin(user_id):
+async def add_admin(user_id):
     try:
         if user_id not in admins:
             admins.append(user_id)
             tag = None
             try:
-                user = bot.get_chat(user_id)
-                tag = user.username
-            except:
+                chat = await bot.get_chat(user_id)
+                tag = chat.username
+            except Exception:
                 pass
             db_execute("INSERT OR IGNORE INTO admins (user_id, tag) VALUES (?, ?)", (user_id, tag))
             logger.info(f"Добавлен админ: {user_id} (@{tag})")
@@ -170,7 +186,7 @@ def backup_database():
 def escape_html(text):
     if text is None:
         return ""
-    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return html.escape(str(text))
 
 def format_user_link(user_id, tag):
     if tag and tag != "no_username":
@@ -197,8 +213,7 @@ def check_spam(user_id):
         logger.warning(f"Пользователь {user_id} забанен за флуд")
         return True, "бан на 5 минут за флуд"
     
-    last_minute = [t for t in user_messages[user_id] if (now - t).total_seconds() < 60]
-    if len(last_minute) > MAX_MESSAGES_PER_MINUTE:
+    if len(user_messages[user_id]) > MAX_MESSAGES_PER_MINUTE:
         banned_users[user_id] = now + timedelta(seconds=SPAM_BAN_TIME)
         logger.warning(f"Пользователь {user_id} забанен за флуд")
         return True, "бан на 5 минут за флуд"
@@ -215,13 +230,18 @@ def ensure_db_directory():
 def check_single_instance():
     global lock_file
     try:
-        lock_file = open(LOCK_FILE, 'w')
+        lock_file = open(LOCK_FILE, 'a+')
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.seek(0)
+        lock_file.truncate()
         lock_file.write(str(os.getpid()))
         lock_file.flush()
         return True
-    except IOError:
+    except (IOError, OSError):
         logger.error("Другой экземпляр бота уже запущен!")
+        if lock_file:
+            lock_file.close()
+            lock_file = None
         return False
 
 def db_connect():
@@ -233,6 +253,7 @@ def db_connect():
             conn = sqlite3.connect(get_db_path(), timeout=10)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=3000")
+            conn.execute("PRAGMA synchronous=NORMAL")
             return conn
         except sqlite3.Error as e:
             logger.error(f"Попытка подключения {attempt + 1} к БД не удалась: {e}")
@@ -269,7 +290,7 @@ def db_execute(query, params=None, fetch=False, fetchall=False):
                 pass
 
 def get_moscow_time():
-    return datetime.utcnow() + timedelta(hours=3)
+    return datetime.now(MSK_TZ).replace(tzinfo=None)
 
 def get_text(text_key, **kwargs):
     try:
@@ -387,20 +408,24 @@ def is_application_locked(user_id):
                 locked_at = datetime.strptime(locked_at_str, '%Y-%m-%d %H:%M:%S.%f')
             else:
                 locked_at = datetime.strptime(locked_at_str, '%Y-%m-%d %H:%M:%S')
-        except:
-            locked_at = datetime.now() - timedelta(minutes=10)
-        
-        if (datetime.now() - locked_at).total_seconds() > 300:
+        except Exception:
+            locked_at = get_moscow_time() - timedelta(minutes=10)
+
+        if (get_moscow_time() - locked_at).total_seconds() > REVIEW_TIMEOUT_SECONDS:
             unlock_application(user_id)
             return None
         return result[0]
     return None
 
 async def auto_unlock_application(user_id, admin_id, message, state: FSMContext):
-    await asyncio.sleep(300)
+    try:
+        await asyncio.sleep(REVIEW_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        return
     locked_by = is_application_locked(user_id)
     if locked_by == admin_id:
         unlock_application(user_id)
+        auto_unlock_tasks.pop(user_id, None)
         try:
             await message.answer("Время на рассмотрение заявки истекло. Заявка разблокирована. Возвращаю в главное меню.")
             await start_command(message, state)
@@ -539,8 +564,7 @@ def get_reapply_warning(user_id):
             except:
                 return None
         
-        now = datetime.now()
-        diff = now - created_at
+        diff = get_moscow_time() - created_at
         
         time_str = format_time_diff(diff)
         old_age = get_age_from_answers(answers_json)
@@ -959,6 +983,11 @@ def check_app_configuration():
         
         for main_admin in MAIN_ADMINS:
             cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (main_admin,))
+
+        # Индексы для быстрых выборок заявок и связанных данных
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_state ON applications(state)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON application_history(user_id, state)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_tag ON blacklist(tag)")
         
         cursor.execute("SELECT COUNT(*) FROM questions")
         if cursor.fetchone()[0] == 0:
@@ -1053,7 +1082,12 @@ check_app_configuration()
 backup_database()
 logger.info("Проверка конфигурации бота завершена")
 
-bot = Bot(token=token, session_timeout=30, request_timeout=30)
+bot = Bot(
+    token=token,
+    session_timeout=30,
+    request_timeout=30,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher(storage=MemoryStorage())
 
 async def send_formatted_message(message: Message, text_key: str, reply_markup=None, **kwargs):
@@ -1085,9 +1119,6 @@ async def send_formatted_message_by_id(user_id: int, text_key: str, **kwargs):
             await bot.send_message(user_id, text=re.sub(r'<[^>]+>', '', text))
         except:
             pass
-
-APPROVED_GROUP_ID = -1003953845640
-APPROVED_TOPIC_ID = 122708
 
 async def send_approved_to_group(user_id: int, admin_id: int = None):
     try:
@@ -1154,23 +1185,27 @@ async def handle_join_request(request: ChatJoinRequest):
     
     user_id = request.from_user.id
     chat_id = request.chat.id
-    
+
+    if settings["chat_id"] and str(chat_id) != str(settings["chat_id"]):
+        logger.info(f"Запрос на вступление в чат {chat_id} игнорируется (не настроенный чат)")
+        return
+
     logger.info(f"Запрос на вступление от {user_id} в чат {chat_id}")
     
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         if member.status in ["member", "administrator", "creator"]:
-            await request.decline()
+            await request.decline_join_request()
             logger.warning(f"❌ Пользователь {user_id} уже в группе")
             return
-    except:
+    except Exception:
         pass
     
     result = db_execute("SELECT state FROM applications WHERE user = ?", (user_id,), fetch=True)
     
     if result and result[0] == "applied":
         try:
-            await request.approve()
+            await request.approve_join_request()
             logger.info(f"✅ Запрос пользователя {user_id} одобрен автоматически")
             
             try:
@@ -1190,7 +1225,7 @@ async def handle_join_request(request: ChatJoinRequest):
             logger.error(f"Ошибка одобрения запроса {user_id}: {e}")
     else:
         try:
-            await request.decline()
+            await request.decline_join_request()
             logger.warning(f"❌ Запрос пользователя {user_id} отклонён (не в списке одобренных)")
         except Exception as e:
             logger.error(f"Ошибка отклонения запроса {user_id}: {e}")
@@ -1340,7 +1375,7 @@ async def process_add_admin(message: Message, state: FSMContext):
             await start_command(message, state)
             return
         
-        if add_admin(user_id):
+        if await add_admin(user_id):
             await message.answer(f"Пользователь {user_id} добавлен в админы")
             try:
                 await bot.send_message(user_id, "Вас добавили в админы бота!")
@@ -3196,6 +3231,50 @@ async def submit_application(message: Message, state: FSMContext):
         logger.error(f"Ошибка отправки заявки: {e}")
         await message.answer(text="Произошла ошибка при отправке заявки")
 
+async def render_application_card(message: Message, app_id, user_id, tag, answers_json):
+    """Формирует и отправляет админу карточку заявки (используется при проверке и листании)."""
+    try:
+        answers = json.loads(answers_json) if answers_json else {}
+    except Exception:
+        answers = {}
+
+    questions = get_questions()
+    user_link = format_user_link(user_id, tag)
+    account_warning = await get_account_age_and_warning(user_id)
+
+    parts = [
+        "Заявка",
+        f"ID: <code>{app_id}</code>",
+        f"Пользователь: {user_link}",
+        f"User ID: <code>{user_id}</code>",
+    ]
+
+    if account_warning:
+        parts.append(account_warning)
+
+    warning = get_reapply_warning(user_id)
+    if warning:
+        parts.append(f"\n{warning}")
+
+    for q_key, q_text, display_text in questions:
+        answer = answers.get(q_key, "Не заполнено")
+        display = display_text.replace("{answer}", escape_html(str(answer)))
+        parts.append(display)
+
+    minutes = REVIEW_TIMEOUT_SECONDS // 60
+    parts.append(f"\nУ вас есть {minutes} минут на рассмотрение")
+
+    keyboard = [
+        [KeyboardButton(text="Одобрить")],
+        [KeyboardButton(text="Отклонить")],
+        [KeyboardButton(text="Следующая")],
+        [KeyboardButton(text="Отмена")]
+    ]
+    markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+    await message.answer(text="\n\n".join(parts), reply_markup=markup, parse_mode="HTML")
+
+
 async def check_applications(message: Message, state: FSMContext):
     admin_id = message.from_user.id
     try:
@@ -3234,48 +3313,7 @@ async def check_applications(message: Message, state: FSMContext):
         task = asyncio.create_task(auto_unlock_application(user_id, admin_id, message, state))
         auto_unlock_tasks[user_id] = task
         
-        keyboard = [
-            [KeyboardButton(text="Одобрить")],
-            [KeyboardButton(text="Отклонить")],
-            [KeyboardButton(text="Следующая")],
-            [KeyboardButton(text="Отмена")]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        
-        try:
-            answers = json.loads(answers_json) if answers_json else {}
-        except:
-            answers = {}
-            
-        questions = get_questions()
-        
-        user_link = format_user_link(user_id, tag)
-        
-        account_warning = await get_account_age_and_warning(user_id)
-        
-        check_text_parts = [
-            f"Заявка",
-            f"ID: <code>{app_id}</code>",
-            f"Пользователь: {user_link}",
-            f"User ID: <code>{user_id}</code>",
-        ]
-        
-        if account_warning:
-            check_text_parts.append(f"{account_warning}")
-        
-        warning = get_reapply_warning(user_id)
-        if warning:
-            check_text_parts.append(f"\n{warning}")
-        
-        for i, (q_key, q_text, display_text) in enumerate(questions, 1):
-            answer = answers.get(q_key, "Не заполнено")
-            safe_answer = escape_html(str(answer))
-            display = display_text.replace("{answer}", safe_answer)
-            check_text_parts.append(display)
-        
-        check_text_parts.append("\nУ вас есть 5 минут на рассмотрение")
-        
-        await message.answer(text="\n\n".join(check_text_parts), reply_markup=markup, parse_mode="HTML")
+        await render_application_card(message, app_id, user_id, tag, answers_json)
         logger.info(f"Админ {admin_id} начал проверку заявки {user_id}")
     except Exception as e:
         logger.error(f"Ошибка проверки: {e}")
@@ -3328,48 +3366,7 @@ async def show_next_application(message: Message, state: FSMContext):
         task = asyncio.create_task(auto_unlock_application(user_id, admin_id, message, state))
         auto_unlock_tasks[user_id] = task
         
-        keyboard = [
-            [KeyboardButton(text="Одобрить")],
-            [KeyboardButton(text="Отклонить")],
-            [KeyboardButton(text="Следующая")],
-            [KeyboardButton(text="Отмена")]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-        
-        try:
-            answers = json.loads(answers_json) if answers_json else {}
-        except:
-            answers = {}
-            
-        questions = get_questions()
-        
-        user_link = format_user_link(user_id, tag)
-        
-        account_warning = await get_account_age_and_warning(user_id)
-        
-        check_text_parts = [
-            f"Заявка",
-            f"ID: <code>{app_id}</code>",
-            f"Пользователь: {user_link}",
-            f"User ID: <code>{user_id}</code>",
-        ]
-        
-        if account_warning:
-            check_text_parts.append(f"{account_warning}")
-        
-        warning = get_reapply_warning(user_id)
-        if warning:
-            check_text_parts.append(f"\n{warning}")
-        
-        for i, (q_key, q_text, display_text) in enumerate(questions, 1):
-            answer = answers.get(q_key, "Не заполнено")
-            safe_answer = escape_html(str(answer))
-            display = display_text.replace("{answer}", safe_answer)
-            check_text_parts.append(display)
-        
-        check_text_parts.append("\nУ вас есть 5 минут на рассмотрение")
-        
-        await message.answer(text="\n\n".join(check_text_parts), reply_markup=markup, parse_mode="HTML")
+        await render_application_card(message, app_id, user_id, tag, answers_json)
         logger.info(f"Админ {admin_id} перешел к следующей заявке (ID: {app_id})")
         
     except Exception as e:
