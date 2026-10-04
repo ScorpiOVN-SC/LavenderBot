@@ -1,1 +1,3 @@
-(empty)
+# Python
+__pycache__/
+*.pyc
