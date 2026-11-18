@@ -1781,7 +1781,7 @@ async def process_search_applications(message: Message, state: FSMContext):
         
         if not results:
             await message.answer(
-                f"❌ Заявок не найдено для: {search}",
+                f"Заявок не найдено для: {search}",
                 reply_markup=ReplyKeyboardMarkup(
                     keyboard=[[KeyboardButton(text="Назад в меню")]],
                     resize_keyboard=True
@@ -1789,15 +1789,11 @@ async def process_search_applications(message: Message, state: FSMContext):
             )
             return
         
+        # Получаем все вопросы для отображения
+        all_questions = get_questions()
+        
         for app in results[:5]:
             app_id, user_id, tag, state, comment, answers_json, created_at, reviewed_by, reviewed_at = app
-            
-            state_emoji = {
-                "created": "📝",
-                "sended": "📤",
-                "applied": "✅",
-                "canceled": "❌"
-            }.get(state, "❓")
             
             state_names = {
                 "created": "Заполняется",
@@ -1808,13 +1804,13 @@ async def process_search_applications(message: Message, state: FSMContext):
             
             user_link = format_user_link(user_id, tag)
             
-            text = f"📋 Заявка #{app_id}\n"
+            text = f"Заявка #{app_id}\n"
             text += f"Пользователь: {user_link}\n"
             text += f"ID: <code>{user_id}</code>\n"
-            text += f"Статус: {state_emoji} {state_names}\n"
+            text += f"Статус: {state_names}\n"
             
             if comment:
-                text += f"Комментарий: {escape_html(comment[:100])}...\n"
+                text += f"Комментарий: {escape_html(comment)}\n"
             
             if created_at:
                 text += f"Создана: {created_at}\n"
@@ -1830,18 +1826,17 @@ async def process_search_applications(message: Message, state: FSMContext):
             if reviewed_at:
                 text += f"Время рассмотрения: {reviewed_at}\n"
             
+            # Отображаем ВСЕ вопросы с ответами
             try:
                 answers = json.loads(answers_json) if answers_json else {}
-                questions = get_questions()
-                text += "\n📝 Ответы:\n"
-                for q_key, q_text, display_text in questions[:3]:
+                text += "\nОтветы:\n"
+                for q_key, q_text, display_text in all_questions:
                     answer = answers.get(q_key, "Не заполнено")
                     display = display_text.replace("{answer}", escape_html(str(answer)))
                     text += f"{display}\n"
-                if len(questions) > 3:
-                    text += f"... и еще {len(questions) - 3} вопросов\n"
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Ошибка парсинга ответов: {e}")
+                text += "\nОшибка при загрузке ответов\n"
             
             keyboard = []
             if state == "sended":
@@ -1856,7 +1851,26 @@ async def process_search_applications(message: Message, state: FSMContext):
             keyboard.append([KeyboardButton(text="Назад в меню")])
             markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
             
-            await message.answer(text, reply_markup=markup, parse_mode="HTML")
+            # Разбиваем длинные сообщения
+            if len(text) > 4000:
+                parts = []
+                current_part = ""
+                for line in text.split('\n'):
+                    if len(current_part) + len(line) + 1 > 4000:
+                        parts.append(current_part)
+                        current_part = line
+                    else:
+                        current_part += line + '\n'
+                if current_part:
+                    parts.append(current_part)
+                
+                for i, part in enumerate(parts):
+                    if i == len(parts) - 1:
+                        await message.answer(part, reply_markup=markup, parse_mode="HTML")
+                    else:
+                        await message.answer(part, parse_mode="HTML")
+            else:
+                await message.answer(text, reply_markup=markup, parse_mode="HTML")
         
         if len(results) > 5:
             await message.answer(f"Показаны первые 5 из {len(results)} найденных заявок. Уточните поиск для более точных результатов.")
@@ -1872,9 +1886,9 @@ async def show_applications_settings_menu(message: Message, state: FSMContext):
     
     settings = get_applications_settings()
     
-    status = "🟢 Открыт" if settings["is_open"] else "🔴 Закрыт"
+    status = "Открыт" if settings["is_open"] else "Закрыт"
     
-    text = f"⚙️ Настройка подачи заявок\n\n"
+    text = f"Настройка подачи заявок\n\n"
     text += f"Статус: {status}\n\n"
     text += "При закрытии подачи заявок:\n"
     text += "• Новые пользователи не смогут подать заявку\n"
@@ -1882,7 +1896,7 @@ async def show_applications_settings_menu(message: Message, state: FSMContext):
     text += "• Существующие заявки продолжают обрабатываться"
     
     keyboard = [
-        [KeyboardButton(text="🟢 Открыть заявки"), KeyboardButton(text="🔴 Закрыть заявки")],
+        [KeyboardButton(text="Открыть заявки"), KeyboardButton(text="Закрыть заявки")],
         [KeyboardButton(text="Назад в меню")]
     ]
     markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -2681,23 +2695,103 @@ async def handle_text(message: Message, state: FSMContext):
         await process_search_applications(message, state)
         return
     
-    if not is_admin(user_id) and is_user_banned(user_id):
-        remaining = (banned_users[user_id] - datetime.now()).seconds
-        await message.answer(f"Вы заблокированы. Осталось: {remaining} сек.")
+    if current_state == Form.waiting_for_comment:
+        user_id_comment = data.get("decline_user_id")
+        if user_id_comment:
+            templates = get_decline_templates()
+            template_found = False
+            for tid, template_text, added_by, added_at in templates:
+                preview = template_text[:40] + "..." if len(template_text) > 40 else template_text
+                if msg_text == preview or msg_text == template_text:
+                    await decline_application(message, state, user_id_comment, template_text)
+                    template_found = True
+                    break
+            
+            if not template_found:
+                await decline_application(message, state, user_id_comment, msg_text)
         return
     
+    if current_state == Form.waiting_for_decline_choice:
+        await process_decline_choice(message, state)
+        return
+    
+    if current_state == Form.waiting_for_new_admin:
+        await process_add_admin(message, state)
+        return
+    
+    if current_state == Form.waiting_for_remove_admin:
+        await process_remove_admin(message, state)
+        return
+    
+    if current_state == Form.waiting_for_blacklist_add:
+        await process_blacklist_add(message, state)
+        return
+    
+    if current_state == Form.waiting_for_blacklist_remove:
+        await process_blacklist_remove(message, state)
+        return
+    
+    if current_state == Form.waiting_for_blacklist_search:
+        await process_blacklist_search(message, state)
+        return
+    
+    if current_state == Form.waiting_for_template_add:
+        await process_template_add(message, state)
+        return
+    
+    if current_state == Form.waiting_for_template_delete:
+        await process_template_delete(message, state)
+        return
+    
+    if is_main_admin(user_id):
+        if current_state == Form.waiting_for_question_key:
+            await handle_question_menu(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_question_text:
+            await handle_question_text_input(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_question_display:
+            await handle_question_display_input(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_display_text:
+            await handle_display_text_input(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_edit_select:
+            await handle_edit_select(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_edit_text:
+            await handle_edit_text_choice(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_edit_display:
+            await handle_edit_display_input(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_delete_select:
+            await handle_delete_question(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_text_select:
+            await handle_text_menu(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_text_edit:
+            await handle_text_edit(message, state, msg_text)
+            return
+        elif current_state == Form.waiting_for_format_select:
+            await handle_format_change(message, state, msg_text)
+            return
+        elif current_state == "waiting_for_format_choice":
+            await apply_format_change(message, state, msg_text)
+            return
+    
     if not is_admin(user_id):
+        if is_user_banned(user_id):
+            remaining = (banned_users[user_id] - datetime.now()).seconds
+            await message.answer(f"Вы заблокированы. Осталось: {remaining} сек.")
+            return
+        
         is_spam, reason = check_spam(user_id)
         if is_spam:
             logger.warning(f"Пользователь {user_id} забанен за флуд: {reason}")
             await message.answer(f"Вы заблокированы: {reason}")
             return
-    
-    if msg_text == "Отменить заявку" and data.get("application_mode"):
-        await state.clear()
-        await message.answer("Заявка отменена", reply_markup=ReplyKeyboardRemove())
-        await start_command(message, state)
-        return
     
     if data.get("application_mode"):
         if msg_text == "Назад":
@@ -2715,24 +2809,17 @@ async def handle_text(message: Message, state: FSMContext):
         elif msg_text == "Назад к вопросам":
             await show_question(message, state, "restore")
             return
+        elif msg_text == "Отменить заявку":
+            await state.clear()
+            await message.answer("Заявка отменена", reply_markup=ReplyKeyboardRemove())
+            await start_command(message, state)
+            return
         else:
             await save_answer_and_continue(message, state, msg_text)
             return
     
     if is_admin(user_id):
-        if msg_text == "Начать проверку":
-            await check_applications(message, state)
-            return
-        elif msg_text == "Поиск заявок":
-            await show_search_applications(message, state)
-            return
-        elif msg_text == "Назад в меню":
-            await start_command(message, state)
-            return
-        elif msg_text.startswith("+"):
-            await add_extra_attempt_from_button(message, msg_text)
-            return
-        elif msg_text.startswith("Одобрить #"):
+        if msg_text.startswith("Одобрить #"):
             try:
                 app_id = int(msg_text.split("#")[1])
                 result = db_execute("SELECT user FROM applications WHERE id = ?", (app_id,), fetch=True)
@@ -2762,35 +2849,18 @@ async def handle_text(message: Message, state: FSMContext):
             except:
                 await message.answer("Ошибка")
             return
-        
-        if is_main_admin(user_id):
-            if msg_text == "Вопросы":
-                await manage_questions_menu(message, state)
-                return
-            elif msg_text == "Тексты":
-                await manage_texts_menu(message, state)
-                return
-            elif msg_text == "Админы":
-                await show_admin_management(message, state)
-                return
-            elif msg_text == "Черный список":
-                await show_blacklist_menu(message, state)
-                return
-            elif msg_text == "Шаблоны отказа":
-                await show_templates_menu(message, state)
-                return
-            elif msg_text == "Настройка приглашений":
-                await show_invite_settings_menu(message, state)
-                return
-            elif msg_text == "Настройка заявок":
-                await show_applications_settings_menu(message, state)
-                return
-            elif msg_text in ["🟢 Открыть заявки", "🔴 Закрыть заявки"]:
-                await handle_applications_settings(message, state, msg_text)
-                return
-            elif msg_text in ["Включить ссылки", "Выключить ссылки", "Включить авто-одобрение", "Выключить авто-одобрение", "Задать ID чата", "Сгенерировать новую ссылку", "Показать текущую ссылку"]:
-                await handle_invite_settings(message, state, msg_text)
-                return
+        elif msg_text.startswith("+"):
+            await add_extra_attempt_from_button(message, msg_text)
+            return
+        elif msg_text == "Начать проверку":
+            await check_applications(message, state)
+            return
+        elif msg_text == "Поиск заявок":
+            await show_search_applications(message, state)
+            return
+        elif msg_text == "Назад в меню":
+            await start_command(message, state)
+            return
         
         if data.get("check_user_id"):
             if msg_text == "Одобрить":
@@ -2823,91 +2893,56 @@ async def handle_text(message: Message, state: FSMContext):
                     unlock_application(current_user_id)
                 await start_command(message, state)
                 return
-    
-    if current_state == Form.waiting_for_decline_choice:
-        await process_decline_choice(message, state)
-        return
-    
-    if current_state == Form.waiting_for_comment:
-        user_id_comment = data.get("decline_user_id")
-        if user_id_comment:
-            templates = get_decline_templates()
-            template_found = False
-            for tid, template_text, added_by, added_at in templates:
-                preview = template_text[:40] + "..." if len(template_text) > 40 else template_text
-                if msg_text == preview or msg_text == template_text:
-                    await decline_application(message, state, user_id_comment, template_text)
-                    template_found = True
-                    break
-            
-            if not template_found:
-                await decline_application(message, state, user_id_comment, msg_text)
-        return
-    
-    if current_state == Form.waiting_for_new_admin:
-        await process_add_admin(message, state)
-        return
-    
-    if current_state == Form.waiting_for_remove_admin:
-        await process_remove_admin(message, state)
-        return
-    
-    if current_state == Form.waiting_for_blacklist_add:
-        await process_blacklist_add(message, state)
-        return
-    
-    if current_state == Form.waiting_for_blacklist_remove:
-        await process_blacklist_remove(message, state)
-        return
-    
-    if current_state == Form.waiting_for_blacklist_search:
-        await process_blacklist_search(message, state)
-        return
-    
-    if current_state == Form.waiting_for_template_add:
-        await process_template_add(message, state)
-        return
-    
-    if current_state == Form.waiting_for_template_delete:
-        await process_template_delete(message, state)
-        return
-    
-    if current_state == Form.waiting_for_question_key:
-        await handle_question_menu(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_question_text:
-        await handle_question_text_input(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_question_display:
-        await handle_question_display_input(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_display_text:
-        await handle_display_text_input(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_edit_select:
-        await handle_edit_select(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_edit_text:
-        await handle_edit_text_choice(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_edit_display:
-        await handle_edit_display_input(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_delete_select:
-        await handle_delete_question(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_text_select:
-        await handle_text_menu(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_text_edit:
-        await handle_text_edit(message, state, msg_text)
-        return
-    elif current_state == Form.waiting_for_format_select:
-        await handle_format_change(message, state, msg_text)
-        return
-    elif current_state == "waiting_for_format_choice":
-        await apply_format_change(message, state, msg_text)
-        return
+        
+        if is_main_admin(user_id):
+            if msg_text == "Вопросы":
+                await manage_questions_menu(message, state)
+                return
+            elif msg_text == "Тексты":
+                await manage_texts_menu(message, state)
+                return
+            elif msg_text == "Админы":
+                await show_admin_management(message, state)
+                return
+            elif msg_text == "Черный список":
+                await show_blacklist_menu(message, state)
+                return
+            elif msg_text == "Шаблоны отказа":
+                await show_templates_menu(message, state)
+                return
+            elif msg_text == "Настройка приглашений":
+                await show_invite_settings_menu(message, state)
+                return
+            elif msg_text == "Настройка заявок":
+                await show_applications_settings_menu(message, state)
+                return
+            elif msg_text in ["🟢 Открыть заявки", "🔴 Закрыть заявки"]:
+                await handle_applications_settings(message, state, msg_text)
+                return
+            elif msg_text in ["Включить ссылки", "Выключить ссылки", "Включить авто-одобрение", "Выключить авто-одобрение", "Задать ID чата", "Сгенерировать новую ссылку", "Показать текущую ссылку"]:
+                await handle_invite_settings(message, state, msg_text)
+                return
+            elif msg_text == "Добавить админа":
+                await handle_add_admin(message, state)
+                return
+            elif msg_text == "Удалить админа":
+                await handle_remove_admin(message, state)
+                return
+            elif msg_text == "Добавить в черный список":
+                await handle_blacklist_add(message, state)
+                return
+            elif msg_text == "Удалить из черного списка":
+                await handle_blacklist_remove(message, state)
+                return
+            elif msg_text == "Найти в черном списке":
+                await search_blacklist(message, state)
+                return
+            elif msg_text == "Добавить шаблон":
+                await handle_template_add(message, state)
+                return
+            elif msg_text == "Удалить шаблон":
+                await handle_template_delete(message, state)
+                return
     
     if msg_text == "🔗 Получить ссылку":
         await get_invite_link_for_user(message, state)
@@ -2934,7 +2969,10 @@ async def handle_text(message: Message, state: FSMContext):
                            Form.waiting_for_edit_text, Form.waiting_for_edit_display,
                            Form.waiting_for_delete_select, Form.waiting_for_text_edit,
                            Form.waiting_for_format_select, "waiting_for_format_choice"]:
-            await manage_questions_menu(message, state)
+            if is_main_admin(user_id):
+                await manage_questions_menu(message, state)
+            else:
+                await start_command(message, state)
             return
         elif current_state == Form.waiting_for_text_select:
             await manage_texts_menu(message, state)
@@ -2966,6 +3004,8 @@ async def handle_text(message: Message, state: FSMContext):
         else:
             await start_command(message, state)
         return
+    
+    logger.info(f"Неизвестное сообщение от {user_id}: {msg_text}")
 
 async def resend_invite_link(message: Message, state: FSMContext, user_id: int):
     if not is_admin(message.from_user.id):
